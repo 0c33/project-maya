@@ -40,8 +40,9 @@ void embed(const uint16_t* rows_bf16, int T, float* h, int dim, int hc, cudaStre
 ///         pos_v = pos + (v / vpp) * pos_step
 ///   quant 0 none, 1 FP8 E4M3 with a power-of-two scale per 32, 2 FP4 E2M1 with an E4M3 scale per 16, 3 FP4 with a
 ///         power-of-two scale per 32 (the reference kernels' act_quant / fp4_act_quant, inplace)
-/// and written back to x, or as BF16 to dst + v * dst_stride when dst is given, or packed (quant > 0: the cache format of
-/// that number, kv_row_bytes) to pdst + v * pdst_stride bytes when pdst is given (x then left as it was).
+/// and written back to x, or as BF16 (dst_f16: FP16, __float2half_rn - rows_f16's rounding) to dst + v * dst_stride when
+/// dst is given, or packed (quant > 0: the cache format of that number, kv_row_bytes) to pdst + v * pdst_stride bytes
+/// when pdst is given (x then left as it was).
 struct Finish {
     const float* w = nullptr;
     float eps = 1e-20f;
@@ -50,6 +51,7 @@ struct Finish {
     int quant = 0;
     uint16_t* dst = nullptr;
     long long dst_stride = 0;
+    int dst_f16 = 0;
     uint8_t* pdst = nullptr;
     long long pdst_stride = 0;
 };
@@ -144,6 +146,10 @@ struct AttnScratch {
     int max_t = 0, cap = 0;     // queries, rows a query (at least the sel_stride)
 };
 constexpr int kAttnScratchT = 7;   // (the staged kernel wins from 8 queries: V100, Sun)
+// heads_per_block kAttnWmma (a prompt chunk's queries): on RDNA 3 (gfx11) 16 heads a block on the matrix cores - the
+// products in BF16 (the query and the probabilities as a high and a low part: within rounding of the FP32 kernels,
+// not their bits); elsewhere, or DS4_ATTN_WMMA=0, as 0
+constexpr int kAttnWmma = 16;
 struct AttnRows {
     int win0[kWin], nwin[kWin], nsel[kWin];
     // gen: query t is a chunk's row t0 + t at position p0 + t0 + t (the window buffer: the ring's win rows before p0,

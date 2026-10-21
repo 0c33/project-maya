@@ -6,6 +6,29 @@
 #if !defined(STRATA_USE_HIP)
 #include <mma.h>
 #endif
+// rocWMMA (the prompt sets on RDNA 3 / 4's matrix cores) as glm_batch.cu reads it: a device pass for gfx11 / gfx12
+// only, the host pass when the build targets such a card (STRATA_HAS_WMMA)
+#if defined(STRATA_USE_HIP) && \
+    ((!(defined(__HIP_DEVICE_COMPILE__) && __HIP_DEVICE_COMPILE__) && STRATA_HAS_WMMA) || \
+     ((defined(__HIP_DEVICE_COMPILE__) && __HIP_DEVICE_COMPILE__) && (defined(__gfx1100__) || defined(__gfx1101__) || \
+      defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__))))
+#define DS4_ROCWMMA 1
+#pragma push_macro("__shfl_xor_sync")
+#undef __shfl_xor_sync
+#pragma push_macro("__shfl_down_sync")
+#undef __shfl_down_sync
+#pragma push_macro("__shfl_up_sync")
+#undef __shfl_up_sync
+#pragma push_macro("__shfl_sync")
+#undef __shfl_sync
+#include <rocwmma/rocwmma.hpp>
+#pragma pop_macro("__shfl_xor_sync")
+#pragma pop_macro("__shfl_down_sync")
+#pragma pop_macro("__shfl_up_sync")
+#pragma pop_macro("__shfl_sync")
+#else
+#define DS4_ROCWMMA 0
+#endif
 
 #define GGML_COMMON_DECL_CUDA
 #define GGML_COMMON_IMPL_CUDA
@@ -14,6 +37,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <unordered_map>
 
@@ -564,23 +588,34 @@ __global__ void __launch_bounds__(kThreads) set_kernel(const SetArgs a) {
     }
 }
 
-#if !defined(STRATA_USE_HIP)
-// the same on the tensor cores (sm_70+): 8 warps each 16 rows x 32 outputs, the tiles F16 in shared memory
-namespace wm = nvcuda::wmma;
+#if !defined(STRATA_USE_HIP) || STRATA_HAS_WMMA
+// the same on the tensor cores (sm_70+; AMD: RDNA 3 / 4's, rocWMMA): 8 warps each 16 rows x 32 outputs, the tiles
+// F16 in shared memory
 constexpr int kLdT = 40;
 template <int T, bool GATE_UP>
 __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
+#if defined(STRATA_USE_HIP) && !DS4_ROCWMMA
+    __builtin_trap();   // (a device pass for a card without WMMA: never launched there - tc_ok)
+#else
+#if defined(STRATA_USE_HIP)
+    namespace wm = rocwmma;
+    using wh = _Float16;
+#else
+    namespace wm = nvcuda::wmma;
+    using wh = __half;
+#endif
     struct Tiles {
         __half x[BM][kLdT], wg[BN][kLdT], wu[GATE_UP ? BN : 1][kLdT];
     };
-    struct Out {
-        float g[BM][BN + 4], u[GATE_UP ? BM : 1][BN + 4];
-    };
-    __shared__ __align__(32) unsigned char smem[sizeof(Tiles) > sizeof(Out) ? sizeof(Tiles) : sizeof(Out)];
+    // the results leave through a 16 x 16 tile a warp in the tiles' room (the gate's and the up's accumulators hold the
+    // same elements, so the SwiGLU runs on them in registers): a block's shared memory is its tiles' alone - 15 KB, not
+    // a 64 x 64 staging of both (35 KB), so more blocks fit a CU to hide the loads (a Radeon 8065S, 32 experts x 128
+    // rows: 7.7-11.4 -> 13.6-14.6 TFLOP/s; a 4K prompt +8%)
+    static_assert(sizeof(Tiles) >= (size_t) (kThreads / 32) * 16 * 16 * sizeof(float), "the warps' output tiles");
+    __shared__ __align__(32) unsigned char smem[sizeof(Tiles)];
     __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
     __shared__ int src[BM];
     Tiles& Tl = *reinterpret_cast<Tiles*>(smem);
-    Out& O = *reinterpret_cast<Out*>(smem);
     const int e = blockIdx.z;
     const int lo = a.bounds[e] - a.row0, hi = a.bounds[e + 1] - a.row0;
     const int r0 = lo + blockIdx.x * BM;
@@ -610,45 +645,57 @@ __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
             for (int j = 0; j < 8; ++j) dst[j] = __float2half_rn(w8[j]);
         }
         const int sr = src[tr];
+        if (a.xh_vec) {   // FP16 rows, 16-byte aligned: 8 values in one load (gate / up: the caller's rows_f16 of the same F32
+            // rows - __float2half_rn as below, so the same bits - not 36 conversions of them, a block column each)
+            uint4 v = make_uint4(0u, 0u, 0u, 0u);
+            if (sr >= 0) v = *reinterpret_cast<const uint4*>(a.xh + (size_t) sr * a.ldx + (size_t) kb * 32 + tq * 8);
+            *reinterpret_cast<uint4*>(&Tl.x[tr][tq * 8]) = v;
+        } else {
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            __half v = __float2half_rn(0.0f);
-            if (sr >= 0) {
-                const size_t at = (size_t) sr * a.ldx + (size_t) kb * 32 + tq * 8 + j;
-                v = GATE_UP ? __float2half_rn(a.xf[at]) : __ushort_as_half(a.xh[at]);
+            for (int j = 0; j < 8; ++j) {
+                __half v = __float2half_rn(0.0f);
+                if (sr >= 0) {
+                    const size_t at = (size_t) sr * a.ldx + (size_t) kb * 32 + tq * 8 + j;
+                    v = GATE_UP ? __float2half_rn(a.xf[at]) : __ushort_as_half(a.xh[at]);
+                }
+                Tl.x[tr][tq * 8 + j] = v;
             }
-            Tl.x[tr][tq * 8 + j] = v;
         }
         __syncthreads();
 #pragma unroll
         for (int kk = 0; kk < 32; kk += 16) {
-            wm::fragment<wm::matrix_a, 16, 16, 16, __half, wm::row_major> fa;
-            wm::load_matrix_sync(fa, &Tl.x[wm_ * 16][kk], kLdT);
+            wm::fragment<wm::matrix_a, 16, 16, 16, wh, wm::row_major> fa;
+            wm::load_matrix_sync(fa, (const wh*) &Tl.x[wm_ * 16][kk], kLdT);
 #pragma unroll
             for (int j = 0; j < 2; ++j) {
-                wm::fragment<wm::matrix_b, 16, 16, 16, __half, wm::col_major> fb;
-                wm::load_matrix_sync(fb, &Tl.wg[(wn + j) * 16][kk], kLdT);
+                wm::fragment<wm::matrix_b, 16, 16, 16, wh, wm::col_major> fb;
+                wm::load_matrix_sync(fb, (const wh*) &Tl.wg[(wn + j) * 16][kk], kLdT);
                 wm::mma_sync(fg[j], fa, fb, fg[j]);
                 if (GATE_UP) {
-                    wm::load_matrix_sync(fb, &Tl.wu[(wn + j) * 16][kk], kLdT);
+                    wm::load_matrix_sync(fb, (const wh*) &Tl.wu[(wn + j) * 16][kk], kLdT);
                     wm::mma_sync(fu[j], fa, fb, fu[j]);
                 }
             }
         }
         __syncthreads();
     }
+    float* ow = reinterpret_cast<float*>(smem) + (size_t) warp * 16 * 16;   // (the K loop's last barrier: tiles free)
+    const int lane = tid & 31;
     for (int j = 0; j < 2; ++j) {
-        wm::store_matrix_sync(&O.g[wm_ * 16][(wn + j) * 16], fg[j], BN + 4, wm::mem_row_major);
-        if (GATE_UP) wm::store_matrix_sync(&O.u[wm_ * 16][(wn + j) * 16], fu[j], BN + 4, wm::mem_row_major);
+        if (GATE_UP)
+            for (int i = 0; i < (int) fg[j].num_elements; ++i) fg[j].x[i] = swiglu(fg[j].x[i], fu[j].x[i], a.limit);
+        wm::store_matrix_sync(ow, fg[j], 16, wm::mem_row_major);
+        __syncthreads();   // (uniform: every warp stores, then reads its own tile)
+        for (int i = lane; i < 16 * 16; i += 32) {
+            const int r = wm_ * 16 + i / 16, c = c0 + (wn + j) * 16 + i % 16;
+            if (r >= nr) continue;
+            const size_t lr = (size_t) (r0 + r);
+            if (GATE_UP) a.h[lr * a.ldo + c] = __half_as_ushort(__float2half_rn(ow[i]));
+            else a.y[lr * a.ldo + c] = ow[i];
+        }
+        __syncthreads();
     }
-    __syncthreads();
-    for (int i = tid; i < BM * BN; i += kThreads) {
-        const int r = i / BN, c = i % BN;
-        if (r >= nr) continue;
-        const size_t lr = (size_t) (r0 + r);
-        if (GATE_UP) a.h[lr * a.ldo + c0 + c] = __half_as_ushort(__float2half_rn(swiglu(O.g[r][c], O.u[r][c], a.limit)));
-        else a.y[lr * a.ldo + c0 + c] = O.g[r][c];
-    }
+#endif
 }
 #endif
 
@@ -768,9 +815,21 @@ __global__ void __launch_bounds__(kThreads) light_kernel(const SetArgs a, const 
         }
 }
 
-bool tc_ok() {   // as ds4_gguf.cu's: sm_70 and later, STRATA_DS4_NO_TC=1 keeps the F32 kernel
+bool tc_ok() {   // as ds4_gguf.cu's: sm_70 and later (AMD: RDNA 3 / 4), STRATA_DS4_NO_TC=1 keeps the F32 kernel
 #if defined(STRATA_USE_HIP)
+#if STRATA_HAS_WMMA
+    static const bool ok = [] {
+        int dev = 0;
+        cudaDeviceProp p{};
+        const char* v = std::getenv("STRATA_DS4_NO_TC");
+        return cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+               (std::strncmp(p.gcnArchName, "gfx11", 5) == 0 || std::strncmp(p.gcnArchName, "gfx12", 5) == 0) &&
+               !(v != nullptr && v[0] == '1');
+    }();
+    return ok;
+#else
     return false;
+#endif
 #else
     static const bool ok = [] {
         int dev = 0, major = 0;
@@ -818,9 +877,11 @@ void dn_ne(const Args& a, dim3 grid, int ne, cudaStream_t s) {
 }
 template <int T, bool GU>
 void launch_set(const SetArgs& a, dim3 grid, cudaStream_t s) {
-#if !defined(STRATA_USE_HIP)
+#if !defined(STRATA_USE_HIP) || STRATA_HAS_WMMA
     if (tc_ok()) {
-        set_tc_kernel<T, GU><<<grid, kThreads, 0, s>>>(a);
+        SetArgs b = a;   // (gate / up: FP16 rows when the caller gave them - set_gate_up's x16)
+        b.xh_vec = b.xh != nullptr && ((uintptr_t) b.xh & 15) == 0 && (b.ldx & 7) == 0 ? 1 : 0;
+        set_tc_kernel<T, GU><<<grid, kThreads, 0, s>>>(b);
         return;
     }
 #endif

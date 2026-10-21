@@ -350,6 +350,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # FMA changes tie results. The embedding gather also relies on separately rounded operations.
     set_source_files_properties(src/kernels/cuda/elementwise.cu src/kernels/cuda/quantize_act.cu
       PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    # EXL3: multiply-adds fused where the source writes them, not after inlining - otherwise a kernel's rounding
+    # depends on where the compiler inlined its GEMV, and a verify window's bits stop matching the token path's
+    set_source_files_properties(src/kernels/cuda/exl3.cu PROPERTIES COMPILE_OPTIONS "-ffp-contract=on")
   endif()
 
   set(STRATA_ORACLE_SOURCE_DIR "" CACHE PATH "Pinned llama.cpp source for independent CUDA parity tests")
@@ -444,10 +447,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # (CUDA, or HIP through include/strata/hip_compat as the GLM engine; Linux and Windows)
   if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(maya-ds4 src/ds4/ds4_main.cpp src/ds4/ds4_model.cu src/ds4/ds4_kernels.cu src/ds4/ds4_vision.cu
-                              src/ds4/ds4_gguf.cu src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp)
+                              src/ds4/ds4_gguf.cu src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp
+                              src/ds4/ds4_lt.cu)
     target_include_directories(maya-ds4 PRIVATE ${_strata_gpu_include_directories} third_party/ggml)
     target_link_libraries(maya-ds4 PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target}
                           ${_strata_gpu_blas_target})
+    if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)   # (the prompt path's dense GEMMs: ds4_lt.cu)
+      set_source_files_properties(src/ds4/ds4_lt.cu PROPERTIES COMPILE_DEFINITIONS STRATA_HIPBLASLT_AVAILABLE=1)
+      target_link_libraries(maya-ds4 PRIVATE roc::hipblaslt)
+    endif()
     if(NOT WIN32)   # mmap / mbind (NUMA)
       add_executable(ds4_cpu_bench tests/ds4_cpu_bench.cpp)
       target_link_libraries(ds4_cpu_bench PRIVATE strata_kernels_cpu)

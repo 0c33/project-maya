@@ -10,6 +10,8 @@
 #include <atomic>
 #include <cfloat>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace strata::ds4 {
 namespace {
@@ -232,7 +234,7 @@ __global__ void __launch_bounds__(kThreads) finish_kernel(float* x, int len, lon
         if (j >= nj) break;
         const int e = threadIdx.x + j * kThreads;
         if (e >= len) continue;
-        if (d != nullptr) d[e] = f2bf16(r[j]);
+        if (d != nullptr) d[e] = f.dst_f16 ? __half_as_ushort(__float2half_rn(r[j])) : f2bf16(r[j]);
         else if (!kPack) v[e] = r[j];
     }
 }
@@ -446,6 +448,49 @@ __global__ void __launch_bounds__(kThreads) gemv_f32_kernel(const float* __restr
     }
     acc = warp_sum(acc);
     if (lane == 0) y[(size_t) t * ldy + row] = acc;
+}
+// ... a prompt's rows: a block 8 rows of W for kGemvT tokens, their inputs kGemvK float4s at a time in shared memory.
+// Each (token, row) sums as the one-token kernel does (a lane's float4s c = lane + 32 j in order, then the warp's sum),
+// so the prompt's router logits keep the token path's bits - with W read once per kGemvT tokens, not once a token (a 4K
+// prompt read DeepSeek-V4.1's 7.9 MB router 4096 times a layer)
+constexpr int kGemvT = 8, kGemvK = 128;
+static_assert(kGemvK % 32 == 0, "a lane's float4s in the one-token kernel's order");
+__global__ void __launch_bounds__(kThreads) gemv_f32_rows_kernel(const float* __restrict__ W, const float* __restrict__ x,
+                                                                 int n, int k, int T, float* __restrict__ y, int ldy) {
+    __shared__ float4 xs[kGemvT][kGemvK];
+    const int row = blockIdx.x * (kThreads / 32) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31, t0 = blockIdx.y * kGemvT, nt = min(kGemvT, T - t0), k4 = k / 4;
+    const float4* w = (const float4*) (W + (size_t) min(row, n - 1) * k);
+    float acc[kGemvT];
+#pragma unroll
+    for (int t = 0; t < kGemvT; ++t) acc[t] = 0.0f;
+    for (int c0 = 0; c0 < k4; c0 += kGemvK) {
+        const int nc = min(kGemvK, k4 - c0);
+        __syncthreads();
+        for (int i = (int) threadIdx.x; i < kGemvT * kGemvK; i += kThreads) {
+            const int t = i / kGemvK, c = i % kGemvK;
+            if (t < nt && c < nc) xs[t][c] = ((const float4*) (x + (size_t) (t0 + t) * k))[c0 + c];
+        }
+        __syncthreads();
+        for (int c = lane; c < nc; c += 32) {
+            const float4 a = w[c0 + c];
+#pragma unroll
+            for (int t = 0; t < kGemvT; ++t) {
+                const float4 b = xs[t][c];
+                acc[t] = fmaf(a.x, b.x, acc[t]);
+                acc[t] = fmaf(a.y, b.y, acc[t]);
+                acc[t] = fmaf(a.z, b.z, acc[t]);
+                acc[t] = fmaf(a.w, b.w, acc[t]);
+            }
+        }
+    }
+    if (row >= n) return;
+#pragma unroll
+    for (int t = 0; t < kGemvT; ++t)
+        if (t < nt) {
+            const float s = warp_sum(acc[t]);
+            if (lane == 0) y[(size_t) (t0 + t) * ldy + row] = s;
+        }
 }
 
 // ---------------------------------------------------------------- the router
@@ -1077,6 +1122,168 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_packed_kernel(const floa
         ov[c] = o0[g] / den;
         ov[c + 1] = o1[g] / den;
     }
+}
+
+// ---------------------------------------------------------------- sparse attention on RDNA 3's matrix cores
+// kAttnWmma: 16 heads of one query a block; each tile of 16 selected rows staged once as BF16 (as the packed kernel),
+// the dots and the weighted sums as v_wmma_f32_16x16x16_bf16 with the query and the probabilities each a BF16 high
+// and low part (two products: ~16 bits of mantissa), the rows exact.  Warp w: the dots over dimensions w * 64 .. + 64
+// (the warps' parts summed in shared memory, in warp order), the online softmax a thread a (head, row), then output
+// dimensions w * 64 .. + 64 (A: lane m and m + 16 hold head m's 16 values; B: lane n and n + 16 column n's; D's
+// element i: head 2i + lane / 16, column lane % 16).
+#if defined(STRATA_USE_HIP) && defined(__GFX11__)
+#define DS4_ATTN_WMMA 1
+typedef short ds4_s16 __attribute__((ext_vector_type(16)));
+typedef float ds4_f8 __attribute__((ext_vector_type(8)));
+#endif
+__device__ __forceinline__ uint16_t f2bf_rn(float x) {   // (round to nearest even; no NaN in these values)
+    uint32_t u = __float_as_uint(x);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (uint16_t) (u >> 16);
+}
+__global__ void __launch_bounds__(kThreads) sparse_attn_wmma_kernel(const float* __restrict__ q,
+                                                                    const uint16_t* __restrict__ win,
+                                                                    const uint8_t* __restrict__ ckv,
+                                                                    const int* __restrict__ sel, int sel_stride,
+                                                                    AttnRows ar, const float* __restrict__ sink,
+                                                                    int heads, float scale, float* __restrict__ out) {
+#if defined(DS4_ATTN_WMMA)
+    constexpr int d = 512, R = 16;
+    const int hb = blockIdx.x * R, t = blockIdx.y;
+    int n_win, n_sel, w0;
+    if (ar.gen) {
+        const long long ta = ar.t0 + t, pa = ar.p0 + ta;
+        const long long first = max((long long) ar.win - ar.p0, ta + 1);
+        w0 = (int) first;
+        n_win = (int) (ar.win + ta - first + 1);
+        n_sel = ar.R > 0 ? (int) min((long long) ar.kcap, (pa + 1) / ar.R) : 0;
+    } else {
+        n_win = ar.nwin[t], n_sel = ar.nsel[t], w0 = ar.win0[t];
+    }
+    const uint16_t* wbase = win + (size_t) w0 * d;
+    const int* sl = sel + (size_t) t * sel_stride;
+    const size_t crow = kv_row_bytes(kKvFp4, d);
+    __shared__ __align__(16) uint16_t tile[R * d];
+    __shared__ float sp[kThreads / 32][R * R];
+    __shared__ float pr[R * R];
+    __shared__ const uint8_t* rows[R];
+    __shared__ float m_run[R], den[R], tsc[R];
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5, m16 = lane & 15, hi = lane >> 4;
+    ds4_s16 qa[4], qb[4];   // A of the dots: head hb + m16, dimensions wp * 64 + kk * 16 .. + 15
+    {
+        const float* qh = q + ((size_t) t * heads + hb + m16) * d + wp * 64;
+#pragma unroll
+        for (int kk = 0; kk < 4; ++kk)
+#pragma unroll
+            for (int e = 0; e < 16; ++e) {
+                const float v = qh[kk * 16 + e];
+                const uint16_t h = f2bf_rn(v);
+                qa[kk][e] = (short) h;
+                qb[kk][e] = (short) f2bf_rn(v - bf16f(h));
+            }
+    }
+    if (threadIdx.x < R) {
+        m_run[threadIdx.x] = -1e30f;
+        den[threadIdx.x] = 0.0f;
+    }
+    ds4_f8 acc[4];
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt) acc[nt] = ds4_f8{};
+    const int sr = threadIdx.x >> 4, part = threadIdx.x & 15;   // the staging: a thread's row and 32 values
+    const int total = n_win + n_sel;
+    for (int t0 = 0; t0 < total; t0 += R) {
+        const int n = min(R, total - t0);
+        if (threadIdx.x < n) {
+            const int j = t0 + threadIdx.x;
+            rows[threadIdx.x] = j < n_win ? (const uint8_t*) (wbase + (size_t) j * d) : ckv + (size_t) sl[j - n_win] * crow;
+        }
+        __syncthreads();
+        {
+            uint4* dst = (uint4*) (tile + sr * d + part * 32);
+            if (sr >= n) {
+                dst[0] = dst[1] = dst[2] = dst[3] = make_uint4(0u, 0u, 0u, 0u);
+            } else if (t0 + sr < n_win) {
+                const uint4* src = (const uint4*) (rows[sr] + part * 64);
+                dst[0] = src[0];
+                dst[1] = src[1];
+                dst[2] = src[2];
+                dst[3] = src[3];
+            } else {
+                unpack32(rows[sr], part, dst);
+            }
+        }
+        __syncthreads();
+        ds4_f8 s = {};
+#pragma unroll
+        for (int kk = 0; kk < 4; ++kk) {   // B: row m16, dimensions wp * 64 + kk * 16 .. + 15
+            const uint4* kr = (const uint4*) (tile + m16 * d + wp * 64 + kk * 16);
+            const uint4 x0 = kr[0], x1 = kr[1];
+            const uint32_t w[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+            ds4_s16 kb;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                kb[2 * e] = (short) (w[e] & 0xffffu);
+                kb[2 * e + 1] = (short) (w[e] >> 16);
+            }
+            s = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(qa[kk], kb, s);
+            s = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(qb[kk], kb, s);
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) sp[wp][(2 * i + hi) * R + m16] = s[i];
+        __syncthreads();
+        {   // thread (head e / 16, row e % 16): the tile's score, the head's running max and denominator
+            const int e = threadIdx.x, h = e >> 4, r = e & 15;
+            float v = 0.0f;
+#pragma unroll
+            for (int w = 0; w < kThreads / 32; ++w) v += sp[w][e];
+            v = r < n ? v * scale : -INFINITY;
+            float mx = v;
+#pragma unroll
+            for (int k = 8; k >= 1; k >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, k));
+            const float m_old = m_run[h], m_new = fmaxf(m_old, mx);
+            const float p = r < n ? expf(v - m_new) : 0.0f;
+            float sum = p;
+#pragma unroll
+            for (int k = 8; k >= 1; k >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, k);
+            pr[e] = p;
+            if (r == 0) {   // (the head's 16 lanes read m_run above, in this same instruction stream)
+                const float ts = expf(m_old - m_new);
+                tsc[h] = ts;
+                den[h] = den[h] * ts + sum;
+                m_run[h] = m_new;
+            }
+        }
+        __syncthreads();
+        ds4_s16 pa, pb;   // A of the weighted sums: head m16's probabilities of the tile's rows
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const float p = pr[m16 * R + r];
+            const uint16_t h = f2bf_rn(p);
+            pa[r] = (short) h;
+            pb[r] = (short) f2bf_rn(p - bf16f(h));
+        }
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {   // B: output dimension wp * 64 + nt * 16 + m16 of the tile's rows
+#pragma unroll
+            for (int i = 0; i < 8; ++i) acc[nt][i] *= tsc[2 * i + hi];
+            const uint16_t* vc = tile + wp * 64 + nt * 16 + m16;
+            ds4_s16 vb;
+#pragma unroll
+            for (int r = 0; r < R; ++r) vb[r] = (short) vc[r * d];
+            acc[nt] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(pa, vb, acc[nt]);
+            acc[nt] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(pb, vb, acc[nt]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int h = 2 * i + hi;
+            const float dn = den[h] + expf(sink[hb + h] - m_run[h]);
+            out[((size_t) t * heads + hb + h) * d + wp * 64 + nt * 16 + m16] = acc[nt][i] / dn;
+        }
+#endif
 }
 
 // the ring's rows are kKvFp8: E4M3 codes, a UE8M0 scale per 32 (decoded: exactly the BF16 values they were made from)
@@ -1841,7 +2048,10 @@ void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, 
 }
 
 void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s) {
-    if (T > 0) gemv_f32_kernel<<<dim3(cdiv(n, kThreads / 32), T), kThreads, 0, s>>>(W, x, n, k, y, ldy);
+    if (T == 1 || (T > 0 && std::getenv("DS4_ROUTER_ROWS") != nullptr && std::atoi(std::getenv("DS4_ROUTER_ROWS")) == 0))
+        gemv_f32_kernel<<<dim3(cdiv(n, kThreads / 32), T), kThreads, 0, s>>>(W, x, n, k, y, ldy);
+    else if (T > 1)   // (DS4_ROUTER_ROWS=0: a launch a token, as before - the same bits)
+        gemv_f32_rows_kernel<<<dim3(cdiv(n, kThreads / 32), cdiv(T, kGemvT)), kThreads, 0, s>>>(W, x, n, k, T, y, ldy);
 }
 
 void route(const float* logits, const float* bias, int n, int k, int T, float route_scale, int* idx, float* w,
@@ -1914,6 +2124,25 @@ static int sm_count() {
     return v;
 }
 
+// sparse_attn_wmma_kernel's device: an RDNA 3 GPU (gfx11), unless DS4_ATTN_WMMA=0 (cached a device)
+static bool attn_wmma_now() {
+#if defined(STRATA_USE_HIP)
+    static const bool off = std::getenv("DS4_ATTN_WMMA") != nullptr && std::atoi(std::getenv("DS4_ATTN_WMMA")) == 0;
+    static std::atomic<int> known[64];   // 0: not asked yet, 1: no, 2: yes
+    int dev = 0;
+    if (off || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    int v = known[dev].load(std::memory_order_relaxed);
+    if (v == 0) {
+        cudaDeviceProp p{};
+        v = cudaGetDeviceProperties(&p, dev) == cudaSuccess && std::strncmp(p.gcnArchName, "gfx11", 5) == 0 ? 2 : 1;
+        known[dev].store(v, std::memory_order_relaxed);
+    }
+    return v == 2;
+#else
+    return false;
+#endif
+}
+
 void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
                  const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
                  int ckv_fmt, int heads_per_block, const AttnScratch* scr) {
@@ -1925,6 +2154,15 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
         sparse_attn_kernel<false><<<dim3(heads, T), kThreads, 0, s>>>(q, win, (const uint16_t*) ckv, sel, sel_stride, a,
                                                                        sink, heads, d, scale, out);
         return;
+    }
+    if (heads_per_block == kAttnWmma) {   // (a prompt chunk: the matrix cores where there are, else as 0)
+        static_assert(kThreads == 256, "the WMMA kernel's softmax: a thread a (head, row) of 16 x 16");
+        if (attn_wmma_now() && heads % 16 == 0) {
+            sparse_attn_wmma_kernel<<<dim3(heads / 16, T), kThreads, 0, s>>>(q, win, (const uint8_t*) ckv, sel,
+                                                                           sel_stride, a, sink, heads, scale, out);
+            return;
+        }
+        heads_per_block = 0;
     }
     // a few queries (a decode step, a short window): their selected rows decoded once a query into the scratch, then
     // the BF16 rows' kernel itself (heads_per_block -1: this way at any T)

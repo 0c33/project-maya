@@ -680,6 +680,8 @@ struct SetK {
     float* y;             // down: F32 out
     int ldo;
     int skip_le;          // the experts of at most this many rows left out (the light kernels took them; ds4_iq.cuh)
+    int xh_vec;           // (AMD's tiles) xh 16-byte aligned F16 rows - gate / up too when the caller gave them (x16, the
+                          // rows_f16 of xf: the same bits) - read 8 values a load
 };
 
 // one 32-value block of BN weight rows (rows c0 .., row bytes rb, block kb) -> ws[32][BN + 1]
@@ -903,14 +905,12 @@ __global__ void __launch_bounds__(kThreads) mx_set_wmma_kernel(const SetK a) {
     struct Tiles {
         _Float16 x[BM][kLdH], wg[BN][kLdH], wu[GATE_UP ? BN : 1][kLdH];
     };
-    struct Out {
-        float g[BM][BN + 4], u[GATE_UP ? BM : 1][BN + 4];
-    };
-    __shared__ __align__(16) unsigned char smem[sizeof(Tiles) > sizeof(Out) ? sizeof(Tiles) : sizeof(Out)];
+    // (the results go out from the accumulators, whose rows set_wmma_row knows: no 64 x 64 staging of them - 15 KB of
+    // shared memory a block, not 35, so more blocks a CU)
+    __shared__ __align__(16) unsigned char smem[sizeof(Tiles)];
     __shared__ float lut[16];
     __shared__ int src[BM];
     Tiles& T = *reinterpret_cast<Tiles*>(smem);
-    Out& O = *reinterpret_cast<Out*>(smem);
     lut_init(lut);
     const int e = blockIdx.z;
     const int lo = a.bounds[e] - a.row0, hi_r = a.bounds[e + 1] - a.row0;
@@ -944,14 +944,20 @@ __global__ void __launch_bounds__(kThreads) mx_set_wmma_kernel(const SetK a) {
             }
         }
         const int sr = src[tr];
+        if (a.xh_vec) {   // (F16 rows: 8 values in one 16-byte load)
+            uint4 v = make_uint4(0u, 0u, 0u, 0u);
+            if (sr >= 0) v = *reinterpret_cast<const uint4*>(a.xh + (size_t) sr * a.ldx + (size_t) kb * kMxBlock + tq * 8);
+            *reinterpret_cast<uint4*>(&T.x[tr][tq * 8]) = v;
+        } else {
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            float v = 0.0f;
-            if (sr >= 0) {
-                const size_t at = (size_t) sr * a.ldx + (size_t) kb * kMxBlock + tq * 8 + j;
-                v = GATE_UP ? a.xf[at] : __half2float(a.xh[at]);
+            for (int j = 0; j < 8; ++j) {
+                float v = 0.0f;
+                if (sr >= 0) {
+                    const size_t at = (size_t) sr * a.ldx + (size_t) kb * kMxBlock + tq * 8 + j;
+                    v = GATE_UP ? a.xf[at] : __half2float(a.xh[at]);
+                }
+                T.x[tr][tq * 8 + j] = (_Float16) v;
             }
-            T.x[tr][tq * 8 + j] = (_Float16) v;
         }
         __syncthreads();
 #pragma unroll
@@ -979,17 +985,11 @@ __global__ void __launch_bounds__(kThreads) mx_set_wmma_kernel(const SetK a) {
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
             const int r = wm_ * 16 + set_wmma_row(i, hi), cc = (wn + j) * 16 + l16;
-            O.g[r][cc] = fg[j][i];
-            if (GATE_UP) O.u[r][cc] = fu[j][i];
+            if (r >= nr) continue;
+            const size_t lr = (size_t) (r0 + r);
+            if (GATE_UP) a.h[lr * a.ldo + c0 + cc] = __float2half_rn(swiglu(fg[j][i], fu[j][i], a.limit));
+            else a.y[lr * a.ldo + c0 + cc] = fg[j][i];
         }
-    __syncthreads();
-    for (int i = tid; i < BM * BN; i += kThreads) {
-        const int r = i / BN, cc = i % BN;
-        if (r >= nr) continue;
-        const size_t lr = (size_t) (r0 + r);
-        if (GATE_UP) a.h[lr * a.ldo + c0 + cc] = __float2half_rn(swiglu(O.g[r][cc], O.u[r][cc], a.limit));
-        else a.y[lr * a.ldo + c0 + cc] = O.g[r][cc];
-    }
 }
 #endif
 bool tc_ok() {   // sm_70 and later (WMMA F16) / AMD gfx11, gfx12 (wave32 WMMA); STRATA_DS4_NO_TC=1 keeps the F32 kernel
@@ -1414,7 +1414,7 @@ iq::SetArgs iq_set(const x3::SetArgs& sa) {   // a set as ds4_iq's arguments (th
 }  // namespace
 
 void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh,
-                 cudaStream_t s) {
+                 cudaStream_t s, const uint16_t* x16) {
     if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
     if (!mx_geometry("set_gate_up", 1, sa.n_embd, sa.n_ff)) return;
     if (!mx_experts(sa.lay)) {   // low-bit experts: ds4_iq's sets
@@ -1422,6 +1422,7 @@ void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_
         if (!iq_args(sa.lay, sa.n_embd, sa.n_ff, sa.limit, ia, "set_gate_up")) return;
         iq::SetArgs q = iq_set(sa);
         q.xf = x;
+        q.xh = x16;   // (the tensor-core tiles' FP16 rows; the light kernels keep xf)
         q.idx = row_idx;
         q.ldx = ldx;
         q.h = h16;
@@ -1461,9 +1462,11 @@ void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_
     k.limit = sa.limit;
     k.xf = x;
     k.idx = row_idx;
+    k.xh = (const __half*) x16;
     k.ldx = ldx;
     k.h = (__half*) h16;
     k.ldo = ldh;
+    k.xh_vec = x16 != nullptr && ((uintptr_t) x16 & 15) == 0 && (ldx & 7) == 0;
     const dim3 grid((unsigned) ((sa.max_rows + BM - 1) / BM), (unsigned) (sa.n_ff / BN), (unsigned) sa.n_exp);
 #if !defined(STRATA_USE_HIP)
     if (tc_ok()) mx_set_tc_kernel<true><<<grid, kThreads, 0, s>>>(k);
@@ -1521,6 +1524,7 @@ void set_down(const x3::SetArgs& sa, const uint16_t* h16, int ldh, float* y, int
     k.ldx = ldh;
     k.y = y;
     k.ldo = ldy;
+    k.xh_vec = ((uintptr_t) h16 & 15) == 0 && (ldh & 7) == 0;
     const dim3 grid((unsigned) ((sa.max_rows + BM - 1) / BM), (unsigned) (sa.n_embd / BN), (unsigned) sa.n_exp);
 #if !defined(STRATA_USE_HIP)
     if (tc_ok()) mx_set_tc_kernel<false><<<grid, kThreads, 0, s>>>(k);

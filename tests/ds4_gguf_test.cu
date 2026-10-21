@@ -490,6 +490,21 @@ void test_experts(int D, int F, cudaStream_t s) {
         CU(cudaStreamSynchronize(s));
         std::vector<uint16_t> h16 = host(dh16, (size_t) R * F);
         std::vector<float> y = host(dy, (size_t) R * D);
+        {   // gate / up given the rows in FP16 too (the prompt path's x16: rows_f16 of the same rows) - bit for bit
+            std::vector<uint16_t> x16(xs.size());
+            for (size_t i = 0; i < xs.size(); ++i) {
+                const __half h = __float2half_rn(xs[i]);
+                std::memcpy(&x16[i], &h, 2);
+            }
+            uint16_t* dx16 = dev(x16);
+            uint16_t* dh2 = dev(std::vector<uint16_t>((size_t) R * F));
+            gg::set_gate_up(sa, dxs, D, didx, dh2, F, s, dx16);
+            CU(cudaStreamSynchronize(s));
+            const bool same = host(dh2, (size_t) R * F) == h16;
+            std::printf("  set gate/up, %d rows, F16 rows given       %s\n", R, same ? "ok    (bit for bit the F32 rows')" : "FAIL");
+            if (!same) ++g_fail;
+            cudaFree(dx16), cudaFree(dh2);
+        }
         std::vector<float> hgot((size_t) R * F);
         std::vector<double> hwant((size_t) R * F), ywant((size_t) R * D);
         // (an expert of at most 16 rows takes the light kernels: its inputs rounded to int8 per 32, as the token path's)
@@ -851,6 +866,21 @@ void test_experts_q(int D, int F, int tg, int td, cudaStream_t s) {
         CU(cudaStreamSynchronize(s));
         std::vector<uint16_t> h16 = host(dh16, (size_t) R * F);
         std::vector<float> y = host(dy, (size_t) R * D);
+        {   // gate / up given the rows in FP16 too (the prompt path's x16: rows_f16 of the same rows) - bit for bit
+            std::vector<uint16_t> x16(xs.size());
+            for (size_t i = 0; i < xs.size(); ++i) {
+                const __half h = __float2half_rn(xs[i]);
+                std::memcpy(&x16[i], &h, 2);
+            }
+            uint16_t* dx16 = dev(x16);
+            uint16_t* dh2 = dev(std::vector<uint16_t>((size_t) R * F));
+            gg::set_gate_up(sa, dxs, D, didx, dh2, F, s, dx16);
+            CU(cudaStreamSynchronize(s));
+            const bool same = host(dh2, (size_t) R * F) == h16;
+            std::printf("  set gate/up, %d rows, F16 rows given       %s\n", R, same ? "ok    (bit for bit the F32 rows')" : "FAIL");
+            if (!same) ++g_fail;
+            cudaFree(dx16), cudaFree(dh2);
+        }
         std::vector<float> hgot((size_t) R * F);
         std::vector<double> hwant((size_t) R * F), ywant((size_t) R * D);
         // (the light kernels, experts of <= 16 rows: the inputs rounded to int8 per 32 as the token path rounds them; the
@@ -1325,6 +1355,32 @@ void kv_same(const char* what, const void* a, const void* b, size_t bytes) {
     std::printf("%-44s %s  %zu bytes %s\n", what, ok ? "ok  " : "FAIL", bytes, ok ? "identical" : "DIFFER");
 }
 
+// the router's F32 GEMV over a prompt's rows (gemv_f32_rows_kernel, kGemvT tokens a block) against a launch a token -
+// bit for bit, so the prompt and the token path route alike (DeepSeek-V4.1's 384 x 5120; odd row and token counts)
+void test_router_rows(cudaStream_t s) {
+    for (int T : {2, 37, 300}) {
+        const int n = 384, k = 5120;
+        std::vector<float> w((size_t) n * k), x((size_t) T * k);
+        for (auto& v : w) v = frand(0.05f);
+        for (auto& v : x) v = frand(2.0f);
+        float *dw = dev(w), *dx = dev(x), *y1 = nullptr, *yt = nullptr;
+        CU(cudaMalloc(&y1, (size_t) T * 1024 * 4));
+        CU(cudaMalloc(&yt, (size_t) T * 1024 * 4));
+        strata::ds4::gemv_f32(dw, dx, n, k, T, yt, 1024, s);
+        for (int t = 0; t < T; ++t) strata::ds4::gemv_f32(dw, dx + (size_t) t * k, n, k, 1, y1 + (size_t) t * 1024, 1024, s);
+        std::vector<float> a((size_t) T * 1024), b((size_t) T * 1024);
+        CU(cudaMemcpy(a.data(), yt, a.size() * 4, cudaMemcpyDeviceToHost));
+        CU(cudaMemcpy(b.data(), y1, b.size() * 4, cudaMemcpyDeviceToHost));
+        int diff = 0;
+        for (int t = 0; t < T; ++t)
+            for (int r = 0; r < n; ++r) diff += std::memcmp(&a[(size_t) t * 1024 + r], &b[(size_t) t * 1024 + r], 4) != 0;
+        std::printf("router rows, %d tokens vs a launch a token     %s    %d of %d logits differ\n", T,
+                    diff ? "FAIL" : "ok  ", diff, T * n);
+        if (diff) ++g_fail;
+        cudaFree(dw), cudaFree(dx), cudaFree(y1), cudaFree(yt);
+    }
+}
+
 void test_kv_pack(cudaStream_t s) {
     const int HD = 512, IX = 128, NC = 65536 / 4 + 1, WIN = 128;
     // the compressed KV (FP4, an E4M3 scale per 16) and the index keys (FP4, a power-of-two scale per 32)
@@ -1486,6 +1542,33 @@ void test_kv_pack(cudaStream_t s) {
                 float ms = 0.0f;
                 CU(cudaEventElapsedTime(&ms, e0, e1));
                 us[w] = ms * 1000.0f / sh.iters;
+            }
+            if (T >= 16) {   // kAttnWmma: the matrix cores (RDNA 3; elsewhere the packed kernel - then the same bits)
+                CU(cudaMemset(o2, 0xff, n * 4));
+                dk::sparse_attn(d_q, ext, c4, d_sel, SEL, ar, d_sink, NH, HD, T, scale, o2, s, dk::kKvFp4, dk::kAttnWmma,
+                                &scr);
+                CU(cudaStreamSynchronize(s));
+                const std::vector<float> got = host(o2, n);
+                double e2 = 0, r2 = 0, worst = 0;
+                for (size_t i = 0; i < n; ++i) {
+                    const double dv = (double) got[i] - want[i];
+                    e2 += dv * dv;
+                    r2 += (double) want[i] * want[i];
+                    worst = std::max(worst, std::fabs(dv));
+                }
+                const double rel = std::sqrt(e2 / std::max(r2, 1e-30)), rms = std::sqrt(r2 / (double) n);
+                CU(cudaEventRecord(e0, s));
+                for (int it = 0; it < sh.iters; ++it)
+                    dk::sparse_attn(d_q, ext, c4, d_sel, SEL, ar, d_sink, NH, HD, T, scale, o2, s, dk::kKvFp4,
+                                    dk::kAttnWmma, &scr);
+                CU(cudaEventRecord(e1, s));
+                CU(cudaEventSynchronize(e1));
+                float ms = 0.0f;
+                CU(cudaEventElapsedTime(&ms, e0, e1));
+                const bool ok = rel < 2e-3 && worst < 2e-2 * std::max(rms, 1e-6) * 10;
+                if (!ok) ++g_fail;
+                std::printf("kv pack: sparse attention, %-22s %s  matrix cores: rel %.2e, worst/rms %.2e, %.1f us a call\n",
+                            sh.what, ok ? "ok  " : "FAIL", rel, worst / std::max(rms, 1e-30), ms * 1000.0f / sh.iters);
             }
             if (!same) ++g_fail;
             char what[96];
@@ -1824,6 +1907,7 @@ int main(int argc, char** argv) {
         return g_fail ? 1 : 0;
     }
     test_kv_pack(s);
+    test_router_rows(s);
     test_mv(s);
     test_engram_q6k(s);
     test_experts(512, 256, s);

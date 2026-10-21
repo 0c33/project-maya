@@ -103,12 +103,25 @@ struct ExpertLayout {
 /// The routed experts of one token (the engine's device plan: plan_ptr[i] = the blob in VRAM, 0 = not on the device;
 /// plan_w[i] its weight).  gate/up over x (n_embd F32) -> clamped swiglu -> h (F32 [k][n_ff], scratch the caller
 /// owns), then down over h, the weighted sum in plan order, + cpu_part when *cpu_flag, + sh_out when given -> out.
+/// A mixed-precision quant's layer (the experts of one layer at different K, gate / up / down of one expert
+/// too): its experts in classes, class c's blobs in VRAM within [lo[c], hi[c]) with the layout lay[c].  n == 0: one
+/// layout for the layer (the args' lay), as before.  The kernels pick each expert's class by its blob's address; a
+/// class's K: 1-4 (K2 2, 4, 6, 8), mul1 (cb 2).
+constexpr int kMaxClasses = 32;
+struct MixedLayouts {
+    int n = 0;
+    unsigned long long lo[kMaxClasses] = {}, hi[kMaxClasses] = {};
+    ExpertLayout lay[kMaxClasses];
+};
+bool mixed_supported(const ExpertLayout& lay);   // a class layout the mixed kernels take
+
 struct MoeArgs {
     const unsigned long long* plan_ptr = nullptr;
     const float* plan_w = nullptr;
     const float* cpu_part = nullptr;
     const int* cpu_flag = nullptr;
     ExpertLayout lay;
+    MixedLayouts mix;     // (n > 0: the experts' layouts by class - lay is not used)
     int k = 8, n_embd = 4096, n_ff = 2048;
     float limit = 0.0f;   // 0: no clamp
 };
@@ -137,6 +150,7 @@ struct WinArgs {
     float* out = nullptr;
     size_t out_stride = 0;
     ExpertLayout lay;
+    MixedLayouts mix;     // (n > 0: the experts' layouts by class - lay is not used)
     int T = 0, k = 8, n_embd = 4096, n_ff = 2048;
     float limit = 0.0f;
     // (given) the combine first waits on the device until *wait_ptr == wait_val (the host's answer to the CPU lane's
@@ -157,6 +171,8 @@ struct SetArgs {
     const uint8_t* wbase = nullptr;
     size_t stride = 0;
     ExpertLayout lay;
+    MixedLayouts mix;     // (n > 0: expert e's blob at eptr[e] (device), its layout by class - wbase, stride, lay unused)
+    const unsigned long long* eptr = nullptr;
     int n_exp = 0;
     const int* bounds = nullptr;
     int row0 = 0;

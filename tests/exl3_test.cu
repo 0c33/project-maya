@@ -568,6 +568,141 @@ void test_set(int k2, int cb, int kd = 0) {
           host_copy(d_out, ref.size()), ref, 3e-3);
 }
 
+// a mixed-precision layer: 3 experts each at its own K for gate / up / down, each in its own allocation
+// (its class), through the token path (moe_gate_up + moe_down, a plan of the 3) and the prompt path (set_gate_up +
+// set_down with an address table) against the reference
+void test_mixed(int cb) {
+    const int E = 512, F = 256, T = 64;
+    const float limit = 1.5f;
+    const int ks[3][3] = {{2, 2, 4}, {4, 2, 6}, {6, 8, 2}};   // (gate, up, down) K2 of each expert
+    const int counts[3] = {37, 5, 70};
+    HostMat parts[3][3];
+    ex::MixedLayouts mix;
+    mix.n = 3;
+    std::vector<uint8_t*> d_blob(3);
+    std::vector<unsigned long long> eptr(3);
+    for (int e = 0; e < 3; ++e) {
+        ex::ExpertLayout& lay = mix.lay[e];
+        lay.cb = cb;
+        size_t at = 0;
+        for (int r = 0; r < 3; ++r) {
+            const int k = r < 2 ? E : F, n = r < 2 ? F : E;
+            lay.k2[r] = ks[e][r];
+            lay.trellis[r] = at;
+            at += (ex::trellis_bytes_k2(k, n, ks[e][r]) + 255) / 256 * 256;
+            lay.suh[r] = at;
+            at += (2 * (size_t) k + 255) / 256 * 256;
+            lay.svh[r] = at;
+            at += (2 * (size_t) n + 255) / 256 * 256;
+        }
+        std::vector<uint8_t> blob(at);
+        for (int r = 0; r < 3; ++r) {
+            parts[e][r] = make_mat(r < 2 ? E : F, r < 2 ? F : E, ks[e][r], cb);
+            const HostMat& p = parts[e][r];
+            std::memcpy(&blob[lay.trellis[r]], p.tr.data(), p.tr.size() * 4);
+            std::memcpy(&blob[lay.suh[r]], p.suh.data(), p.suh.size() * 2);
+            std::memcpy(&blob[lay.svh[r]], p.svh.data(), p.svh.size() * 2);
+        }
+        d_blob[(size_t) e] = dev_copy(blob);
+        eptr[(size_t) e] = (unsigned long long) d_blob[(size_t) e];
+        mix.lo[e] = eptr[(size_t) e];
+        mix.hi[e] = eptr[(size_t) e] + at;
+    }
+    // the reference's weights
+    std::vector<float> w[3][3];
+    for (int e = 0; e < 3; ++e)
+        for (int r = 0; r < 3; ++r) {
+            const int k = r < 2 ? E : F, n = r < 2 ? F : E;
+            w[e][r].resize((size_t) k * n);
+            cpu::exl3_inner_k2(parts[e][r].tr.data(), n / 16, k, n, ks[e][r], cb, w[e][r].data());
+        }
+    auto expert = [&](int e, const float* xr, bool h16, float* out) {   // one expert's output for one row
+        std::vector<float> gg((size_t) F), uu((size_t) F), hh((size_t) F);
+        cpu::exl3_mv(w[e][0].data(), parts[e][0].suh.data(), parts[e][0].svh.data(), E, F, xr, gg.data());
+        cpu::exl3_mv(w[e][1].data(), parts[e][1].suh.data(), parts[e][1].svh.data(), E, F, xr, uu.data());
+        for (int i = 0; i < F; ++i) {
+            const float gv = std::min(gg[(size_t) i], limit), uv = std::min(std::max(uu[(size_t) i], -limit), limit);
+            const float v = gv / (1.0f + std::exp(-gv)) * uv;
+            hh[(size_t) i] = h16 ? f32_from_f16(f16_from_f32(v)) : v;
+        }
+        cpu::exl3_mv(w[e][2].data(), parts[e][2].suh.data(), parts[e][2].svh.data(), F, E, hh.data(), out);
+    };
+    // the token path: one token, a plan of the 3 experts
+    {
+        std::vector<float> x = rand_x(E), pw = {0.5f, 0.3f, 0.2f}, ref((size_t) E, 0.0f), o((size_t) E);
+        for (int e = 0; e < 3; ++e) {
+            expert(e, x.data(), false, o.data());
+            for (int i = 0; i < E; ++i) ref[(size_t) i] += pw[(size_t) e] * o[(size_t) i];
+        }
+        unsigned long long* d_plan = dev_copy(eptr);
+        float* d_pw = dev_copy(pw);
+        float* d_x = dev_copy(x);
+        float* d_out = nullptr;
+        CK(cudaMalloc(&d_out, (size_t) E * 4));
+        ex::MoeArgs ma;
+        ma.plan_ptr = d_plan;
+        ma.plan_w = d_pw;
+        ma.mix = mix;
+        ma.k = 3;
+        ma.n_embd = E;
+        ma.n_ff = F;
+        ma.limit = limit;
+        ex::moe_gate_up(ma, d_x, nullptr, 0);
+        ex::moe_down(ma, nullptr, nullptr, d_out, 0);
+        CK(cudaDeviceSynchronize());
+        close(("moe mixed cb" + std::to_string(cb) + " (3 experts, K 1/1/2, 2/1/3, 3/4/1)").c_str(),
+              host_copy(d_out, (size_t) E), ref, 3e-3);
+        cudaFree(d_plan);
+        cudaFree(d_pw);
+        cudaFree(d_x);
+        cudaFree(d_out);
+    }
+    // the prompt path: the sorted rows of the 3 experts, the set's addresses in a table
+    {
+        std::vector<float> x = rand_x(T * E);
+        std::vector<int> bounds = {0}, row_tok;
+        for (int e = 0; e < 3; ++e) {
+            for (int j = 0; j < counts[e]; ++j) row_tok.push_back((e * 7 + j) % T);
+            bounds.push_back((int) row_tok.size());
+        }
+        const int rows = (int) row_tok.size();
+        unsigned long long* d_eptr = dev_copy(eptr);
+        float* d_x = dev_copy(x);
+        int* d_bounds = dev_copy(bounds);
+        int* d_rows = dev_copy(row_tok);
+        uint16_t* d_h = nullptr;
+        float* d_out = nullptr;
+        CK(cudaMalloc(&d_h, (size_t) rows * F * 2));
+        CK(cudaMalloc(&d_out, (size_t) rows * E * 4));
+        ex::SetArgs sa;
+        sa.mix = mix;
+        sa.eptr = d_eptr;
+        sa.n_exp = 3;
+        sa.bounds = d_bounds;
+        sa.row0 = 0;
+        sa.max_rows = 70;
+        sa.n_embd = E;
+        sa.n_ff = F;
+        sa.limit = limit;
+        ex::set_gate_up(sa, d_x, E, d_rows, d_h, F, 0);
+        ex::set_down(sa, d_h, F, d_out, E, 0);
+        CK(cudaDeviceSynchronize());
+        std::vector<float> ref((size_t) rows * E);
+        for (int e = 0, r = 0; e < 3; ++e)
+            for (int j = 0; j < counts[e]; ++j, ++r)
+                expert(e, x.data() + (size_t) row_tok[(size_t) r] * E, true, ref.data() + (size_t) r * E);
+        close(("set mixed cb" + std::to_string(cb) + " (3 experts, 112 rows)").c_str(), host_copy(d_out, ref.size()),
+              ref, 3e-3);
+        cudaFree(d_eptr);
+        cudaFree(d_x);
+        cudaFree(d_bounds);
+        cudaFree(d_rows);
+        cudaFree(d_h);
+        cudaFree(d_out);
+    }
+    for (uint8_t* b : d_blob) cudaFree(b);
+}
+
 // mv with several activations (a verify window's tokens) against one mv job per activation: the same bits
 void test_mv_n(int k, int n, int k2, int cb, bool q8, int ncol) {
     HostMat h = make_mat(k, n, k2, cb);
@@ -643,18 +778,22 @@ void test_mv_n(int k, int n, int k2, int cb, bool q8, int ncol) {
 // a verify window's routed experts (win_experts: each distinct expert once for its tokens) against each token's
 // moe_gate_up + moe_down: the same bits.  T tokens, k plan entries each over a few experts (shared ones, a skipped
 // entry, a token whose CPU-lane flag is off)
-void test_win(int k2, int cb, int T, int kd = 0) {
+// mixed: a mixed-precision layer instead - each expert its own class, its gate / up / down at K 1-4 by expert and part
+void test_win(int k2, int cb, int T, int kd = 0, bool mixed = false) {
     if (kd <= 0) kd = k2;
     const int E = 512, F = 384, k = 4, NX = 5;
     const float limit = 1.5f;
     ex::ExpertLayout lay;
     lay.cb = cb;
+    ex::MixedLayouts mix;
+    if (mixed) mix.n = NX;
     std::vector<uint8_t*> d_blob((size_t) NX);
     for (int e = 0; e < NX; ++e) {
         std::vector<uint8_t> b;
         size_t at = 0;
         for (int r = 0; r < 3; ++r) {
-            const HostMat p = r < 2 ? make_mat(E, F, k2, cb) : make_mat(F, E, kd, cb);
+            const int kr = mixed ? 2 * (1 + (e + 2 * r) % 4) : r < 2 ? k2 : kd;
+            const HostMat p = r < 2 ? make_mat(E, F, kr, cb) : make_mat(F, E, kr, cb);
             const size_t o_suh = at, o_svh = o_suh + p.suh.size() * 2, o_tr = o_svh + p.svh.size() * 2 + 4;
             at = o_tr + p.tr.size() * 4;
             b.resize(at);
@@ -664,9 +803,14 @@ void test_win(int k2, int cb, int T, int kd = 0) {
             lay.suh[r] = o_suh;
             lay.svh[r] = o_svh;
             lay.trellis[r] = o_tr;
-            lay.k2[r] = r < 2 ? k2 : kd;
+            lay.k2[r] = kr;
         }
         d_blob[(size_t) e] = dev_copy(b);
+        if (mixed) {
+            mix.lay[e] = lay;
+            mix.lo[e] = (unsigned long long) d_blob[(size_t) e];
+            mix.hi[e] = mix.lo[e] + b.size();
+        }
     }
     // plans [T][8]: entry i of token t on expert (t + 2 i) % NX, entry 1 of every third token skipped
     std::vector<unsigned long long> plan((size_t) T * 8, 0ull);
@@ -721,6 +865,7 @@ void test_win(int k2, int cb, int T, int kd = 0) {
         a.cpu_part = d_cpu + (size_t) t * E;
         a.cpu_flag = d_flag + t;
         a.lay = lay;
+        a.mix = mix;
         a.k = k;
         a.n_embd = E;
         a.n_ff = F;
@@ -745,6 +890,7 @@ void test_win(int k2, int cb, int T, int kd = 0) {
     w.out = d_on;
     w.out_stride = E;
     w.lay = lay;
+    w.mix = mix;
     w.T = T;
     w.k = k;
     w.n_embd = E;
@@ -755,8 +901,9 @@ void test_win(int k2, int cb, int T, int kd = 0) {
     const std::vector<float> a = host_copy(d_o1, (size_t) T * E), b = host_copy(d_on, (size_t) T * E);
     size_t diff = 0;
     for (size_t i = 0; i < a.size(); ++i) diff += std::memcmp(&a[i], &b[i], sizeof(float)) != 0;
-    const std::string what = "win K" + kname3(k2, kd) + " cb" + std::to_string(cb) + " " + std::to_string(T) +
-                             " tokens, " + std::to_string(gp.size()) + " experts";
+    const std::string what = (mixed ? std::string("win mixed K1-4") : "win K" + kname3(k2, kd)) + " cb" +
+                             std::to_string(cb) + " " + std::to_string(T) + " tokens, " + std::to_string(gp.size()) +
+                             " experts";
     std::printf("  %-44s %zu of %zu differ from the token path  %s\n", what.c_str(), diff, a.size(),
                 diff == 0 ? "ok" : "FAIL");
     if (diff != 0) ++g_fail;
@@ -1409,7 +1556,104 @@ void test_expect(const std::string& dir) {
 
 }  // namespace
 
+// --bench: one decode token's routed experts at DeepSeek-V4.1's geometry (6 of them, 5120 -> 2304 -> 5120), the
+// one-layout kernels against the mixed ones (the same experts as one class each; then K 1 / 2 / 3 mixed) - ms a token
+// for one layer (x40 for the model)
+void bench_moe() {
+    const int E = 5120, F = 2304, k = 6, iters = 200;
+    auto build = [&](const int (*ks)[3], ex::MixedLayouts& mix, std::vector<unsigned long long>& ptrs,
+                     std::vector<uint8_t*>& blobs) {
+        mix = ex::MixedLayouts{};
+        mix.n = k;
+        for (int e = 0; e < k; ++e) {
+            ex::ExpertLayout& lay = mix.lay[e];
+            lay.cb = 2;
+            size_t at = 0;
+            for (int r = 0; r < 3; ++r) {
+                const int kk = r < 2 ? E : F, n = r < 2 ? F : E;
+                lay.k2[r] = ks[e][r];
+                lay.trellis[r] = at;
+                at += (ex::trellis_bytes_k2(kk, n, ks[e][r]) + 255) / 256 * 256;
+                lay.suh[r] = at;
+                at += (2 * (size_t) kk + 255) / 256 * 256;
+                lay.svh[r] = at;
+                at += (2 * (size_t) n + 255) / 256 * 256;
+            }
+            std::vector<uint8_t> blob(at);
+            for (int r = 0; r < 3; ++r) {
+                const HostMat h = make_mat(r < 2 ? E : F, r < 2 ? F : E, ks[e][r], 2);
+                std::memcpy(&blob[lay.trellis[r]], h.tr.data(), h.tr.size() * 4);
+                std::memcpy(&blob[lay.suh[r]], h.suh.data(), h.suh.size() * 2);
+                std::memcpy(&blob[lay.svh[r]], h.svh.data(), h.svh.size() * 2);
+            }
+            blobs.push_back(dev_copy(blob));
+            ptrs.push_back((unsigned long long) blobs.back());
+            mix.lo[e] = ptrs.back();
+            mix.hi[e] = ptrs.back() + at;
+        }
+    };
+    std::vector<float> x = rand_x(E), pw(k, 1.0f / k);
+    float* d_x = dev_copy(x);
+    float* d_pw = dev_copy(pw);
+    float* d_out = nullptr;
+    CK(cudaMalloc(&d_out, (size_t) E * 4));
+    auto time = [&](const ex::MoeArgs& ma) {
+        cudaEvent_t a, b;
+        cudaEventCreate(&a);
+        cudaEventCreate(&b);
+        for (int i = 0; i < 5; ++i) {
+            ex::moe_gate_up(ma, d_x, nullptr, 0);
+            ex::moe_down(ma, nullptr, nullptr, d_out, 0);
+        }
+        cudaEventRecord(a, 0);
+        for (int i = 0; i < iters; ++i) {
+            ex::moe_gate_up(ma, d_x, nullptr, 0);
+            ex::moe_down(ma, nullptr, nullptr, d_out, 0);
+        }
+        cudaEventRecord(b, 0);
+        cudaEventSynchronize(b);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, a, b);
+        return ms / iters;
+    };
+    const int k1[6][3] = {{2, 2, 2}, {2, 2, 2}, {2, 2, 2}, {2, 2, 2}, {2, 2, 2}, {2, 2, 2}};
+    const int kx[6][3] = {{2, 2, 2}, {2, 2, 2}, {4, 4, 4}, {2, 2, 4}, {6, 6, 6}, {4, 2, 4}};
+    for (const auto* ks : {k1, kx}) {
+        ex::MixedLayouts mix;
+        std::vector<unsigned long long> ptrs;
+        std::vector<uint8_t*> blobs;
+        build(ks, mix, ptrs, blobs);
+        unsigned long long* d_plan = dev_copy(ptrs);
+        ex::MoeArgs ma;
+        ma.plan_ptr = d_plan;
+        ma.plan_w = d_pw;
+        ma.k = k;
+        ma.n_embd = E;
+        ma.n_ff = F;
+        ma.limit = 10.0f;
+        const bool uniform = ks == k1;
+        float one = -1;
+        if (uniform) {   // (all K 1: also through the one-layout kernels, every expert at its own address)
+            ma.lay = mix.lay[0];
+            one = time(ma);
+        }
+        ma.mix = mix;
+        const float mixed = time(ma);
+        std::printf("  bench %s: one layout %.3f ms, mixed kernels %.3f ms a layer's token\n",
+                    uniform ? "6 experts at K 1" : "6 experts at K 1-3", one, mixed);
+        cudaFree(d_plan);
+        for (uint8_t* p : blobs) cudaFree(p);
+    }
+    cudaFree(d_x);
+    cudaFree(d_pw);
+    cudaFree(d_out);
+}
+
 int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--bench") {
+        bench_moe();
+        return 0;
+    }
     int dev = 0;
     cudaDeviceProp p{};
     CK(cudaGetDevice(&dev));
@@ -1489,6 +1733,9 @@ int main(int argc, char** argv) {
     for (int k2 : {3, 5, 7}) test_set(k2, 2);
     test_set(7, 2, 10);
     test_set(5, 2, 8);
+    for (int cb : {0, 2}) test_mixed(cb);   // (a mixed-precision layer)
+    for (int T : {2, 7, 16}) test_win(4, 2, T, 0, true);   // (a mixed layer's window: the token path's bits too)
+    test_win(4, 0, 7, 0, true);
     for (int k2 : {3, 5, 7}) test_cpu(512, 256, k2);
     test_cpu(4096, 2048, 7);
     test_cpu(2048, 4096, 7);

@@ -40,7 +40,8 @@ def need(st: SafeTensors, t: dict) -> list[str]:
         for n in ("attn.wq_a.trellis", "attn.wq_b.trellis", "attn.wkv.trellis", "attn.wo_b.trellis",
                   "attn.attn_sink", "attn.q_norm.weight", "attn.kv_norm.weight", "attn_norm.weight", "ffn_norm.weight",
                   "ffn.gate.weight", "ffn.gate.bias", "hc_attn_fn", "hc_ffn_fn", "ffn.shared_experts.w1.trellis"):
-            if not st.has(L + n):
+            # (a dense matrix as EXL3, or as BF16 / Q8_0 - fp8_dense.py's for a quant that kept DeepSeek's FP8)
+            if not st.has(L + n) and not (n.endswith(".trellis") and st.has(L + n[:-len(".trellis")] + ".weight")):
                 miss.append(L + n)
         if li in t["engram_layer_ids"] and not st.has(L + "engram.embed.weight"):
             miss.append(L + "engram.embed.weight (shards 47 / 48 of deepseek-ai/DeepSeek-V4.1-Flash-1017)")
@@ -112,6 +113,19 @@ def main() -> int:
     if q.get("quant_method") != "exl3":
         raise SystemExit("%s: not an EXL3 model (quant_method %r)" % (model, q.get("quant_method")))
     st = SafeTensors(model)
+    dense = model / "maya-dense-bf16.safetensors"   # (fp8_dense.py: the FP8 dense weights as BF16, in their place)
+    if dense.is_file():
+        with dense.open("rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            h = json.loads(f.read(n))
+        for k, v in h.items():
+            if k != "__metadata__":
+                a, b = v["data_offsets"]
+                st.t[k] = (dense.name, v["dtype"], tuple(v["shape"]), 8 + n + a, b - a)
+        if dense.name not in st.files:
+            st.files.append(dense.name)
+    elif any(v[1] == "F8_E4M3" and not k.startswith("vision.") and ".engram.embed." not in k for k, v in st.t.items()):
+        raise SystemExit("%s keeps dense weights in FP8: python tools/ds4/fp8_dense.py --model %s first" % (model, model))
     miss = need(st, t)
     if miss:
         raise SystemExit("missing tensors:\n  " + "\n  ".join(miss[:20]))
