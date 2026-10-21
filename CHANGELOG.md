@@ -4,6 +4,28 @@ Every release is on GitHub (Releases) with these notes; every published change m
 dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.21 - 2026-10-21
+
+DeepSeek-V4.1-Flash reads prompts about 2.4x faster on AMD Strix Halo and Radeon RDNA 3 / 4, decodes faster where its
+experts sit in GPU memory, and EXL3 runs faster on AMD.
+
+- **DeepSeek prompts on AMD: about 2.4x faster** (Maya-S on a Ryzen AI Max through the server, 4K-18K-token prompts,
+  2.35-2.53x), the answers the same within rounding:
+  - the sparse attention and the low-bit experts run on the matrix cores (RDNA 3 / 4);
+  - the dense projections run on hipBLASLt with the fastest kernel for each shape measured on your GPU, kept in the
+    pack (`lt-picks.txt`) so only the first start pays the tuning;
+  - larger attention slabs where the GPU has the memory (sized from it: 32 GB and smaller cards as before), leaner
+    expert tiles, the router 8 tokens at a time, the experts reading the prompt's FP16 rows - the same results bit
+    for bit.
+  `DS4_LT=0`, `DS4_ATTN_WMMA=0`, `MAYA_DS4_NO_TC=1` and `DS4_ROUTER_ROWS=0` turn parts off.
+- **DeepSeek on NVIDIA:** the same leaner expert tiles - a prompt's expert sets 5-11% faster on a V100.
+- **DeepSeek decode: layers whose experts are all in GPU memory skip the host** (no mailbox, no wait) - about 9% more
+  tokens a second with Maya-S on a Ryzen AI Max, the same tokens. `DS4_HOST_FREE=0` = before.
+- **EXL3 on AMD: the experts about 30% faster**, and every EXL3 kernel rounds alike on AMD (drafting no longer changes
+  answers there).
+- **Tests:** the DeepSeek-V4.1 encoding fixtures stay byte for byte on Windows clones; DeepSeek's chat encoding checked
+  against DeepSeek's official repository: identical.
+
 ## v1.1.20 - 2026-10-21
 
 Stop now stops at once, DeepSeek-V4.1-Flash decodes ~6.5% faster on a Strix Halo and fits its GPU memory by itself,
