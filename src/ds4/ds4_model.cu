@@ -1113,7 +1113,10 @@ struct Model::Impl {
         std::vector<std::vector<uint8_t>> win;
         std::vector<std::vector<float>> comp;
     };
-    Check ck[2];                      // the end of the last prompt, and the position before it
+    Check ck[3];                      // the end of the last prompt, the position before it, and the anchor: the
+                                      // position before the end of the first prompt of the run of prompts that each
+                                      // continued the last in place (a chat template that drops earlier turns'
+                                      // reasoning at a new user message re-renders the history from about there)
     bool slot_held = false;           // slot_save took this state and nothing has changed it since
     std::vector<uint32_t> prof;       // [nl][n_exp] routed-expert hits
     // ... as loaded (--no-expert-cache: what the flow's early reads go by, so a prompt is streamed and summed in the
@@ -5383,7 +5386,7 @@ struct Model::Impl {
         toks.clear();
         ctoks.clear();
         slot_held = false;
-        ck[0].pos = ck[1].pos = -1;
+        ck[0].pos = ck[1].pos = ck[2].pos = -1;
         for (Layer& l0 : L)
             for (int m = 0; m < l0.nm; ++m) {
                 Layer& l = member(l0, m);
@@ -5429,13 +5432,40 @@ struct Model::Impl {
     // the checkpoint at or before position limit (the state's tokens agree with a new prompt up to there), or -1
     int best_check(int64_t limit) const {
         int b = -1;
-        for (int i = 0; i < 2; ++i)
+        for (int i = 0; i < 3; ++i)
             if (ck[i].pos >= 0 && ck[i].pos <= limit && ck[i].pos <= pos && (b < 0 || ck[i].pos > ck[b].pos)) b = i;
         return b;
     }
     int64_t restorable(int64_t limit) const {
         const int b = best_check(limit);
         return b < 0 ? -1 : ck[b].pos;
+    }
+
+    // checkpoint 1 (the position before the last prompt's end) becomes the anchor too
+    void pin() {
+        if (ck[1].pos > 0) ck[2] = ck[1];
+    }
+    // the checkpoints the state can go back to (what a slot of it keeps), latest first
+    std::vector<int64_t> check_positions() const {
+        std::vector<int64_t> v;
+        for (const Check& c : ck)
+            if (c.pos > 0 && c.pos <= pos && c.win.size() == L.size() &&
+                std::find(v.begin(), v.end(), c.pos) == v.end())
+                v.push_back(c.pos);
+        std::sort(v.rbegin(), v.rend());
+        return v;
+    }
+    // the checkpoints a slot keeps (each with its role: 0, 1 or the anchor)
+    std::vector<int> slot_checks() const {
+        std::vector<int> v;
+        for (int i = 0; i < 3; ++i)
+            if (ck[i].pos > 0 && ck[i].pos <= pos && ck[i].win.size() == L.size()) v.push_back(i);
+        return v;
+    }
+    size_t check_bytes() const {
+        size_t n = 16;
+        for (const Layer& l : L) n += (size_t) g.win * win_rb() + (l.c_kv ? 2 * (size_t) l.ratio * g.hd * 4 : 0);
+        return n;
     }
 
     bool restore(int64_t limit) {
@@ -5484,6 +5514,7 @@ struct Model::Impl {
         size_t n = 8 + 8 + slot_identity().size() + 8 + (size_t) pos * 4;
         for (const Layer& l : L) n += 8 + (size_t) g.win * win_rb() + 8 + (l.c_kv ? 2 * (size_t) l.ratio * g.hd * 4 : 0);
         for (const Src& s : srcs) n += 8 + (size_t) src_rows(s) * (ckv_rb() + ik_rb());
+        n += 8 + slot_checks().size() * check_bytes();   // (the checkpoints: what the slot can be taken back at)
         return n + 8;
     }
 
@@ -5564,6 +5595,24 @@ struct Model::Impl {
                 return 0;
             }
             off += cb + ib;
+        }
+        {
+            const std::vector<int> cs = slot_checks();
+            const uint64_t nc = cs.size();
+            put(&nc, 8);
+            for (int k : cs) {
+                const Check& c = ck[k];
+                const uint64_t role = (uint64_t) k, cp = (uint64_t) c.pos;
+                put(&role, 8);
+                put(&cp, 8);
+                for (size_t i = 0; i < L.size(); ++i) {
+                    put(c.win[i].data(), (size_t) g.win * win_rb());
+                    if (L[i].c_kv) {
+                        put(c.comp[2 * i].data(), (size_t) L[i].ratio * g.hd * 4);
+                        put(c.comp[2 * i + 1].data(), (size_t) L[i].ratio * g.hd * 4);
+                    }
+                }
+            }
         }
         if (off + 8 != out.size()) {
             err = "the state's size does not add up";
@@ -5706,6 +5755,54 @@ struct Model::Impl {
             }
             off += cb + ib;
         }
+        Check got[3];   // the slot's checkpoints: the positions it can be taken back at
+        {
+            uint64_t nc = 0;
+            if (!room(8)) {
+                err = "the slot is cut short";
+                return false;
+            }
+            std::memcpy(&nc, data + off, 8);
+            off += 8;
+            if (nc > 3) {
+                err = "the slot's checkpoints are damaged";
+                return false;
+            }
+            for (uint64_t k = 0; k < nc; ++k) {
+                uint64_t role = 0, cp = 0;
+                if (!room(16)) {
+                    err = "the slot is cut short";
+                    return false;
+                }
+                std::memcpy(&role, data + off, 8);
+                std::memcpy(&cp, data + off + 8, 8);
+                off += 16;
+                if (role > 2 || got[role].pos >= 0 || cp == 0 || cp > (uint64_t) n_pos) {
+                    err = "the slot's checkpoints are damaged";
+                    return false;
+                }
+                Check& c = got[role];
+                c.pos = (int64_t) cp;
+                c.win.resize(L.size());
+                c.comp.resize(L.size() * 2);
+                for (size_t i = 0; i < L.size(); ++i) {
+                    const size_t wb = (size_t) g.win * win_rb(), cb = L[i].c_kv ? (size_t) L[i].ratio * g.hd * 4 : 0;
+                    if (!room(wb + 2 * cb)) {
+                        err = "the slot is cut short";
+                        return false;
+                    }
+                    c.win[i].assign(data + off, data + off + wb);
+                    off += wb;
+                    if (cb > 0) {
+                        c.comp[2 * i].resize(cb / 4);
+                        c.comp[2 * i + 1].resize(cb / 4);
+                        std::memcpy(c.comp[2 * i].data(), data + off, cb);
+                        std::memcpy(c.comp[2 * i + 1].data(), data + off + cb, cb);
+                        off += 2 * cb;
+                    }
+                }
+            }
+        }
         uint64_t end = 0;
         if (!room(8)) {
             err = "the slot is cut short";
@@ -5722,7 +5819,8 @@ struct Model::Impl {
         ctoks.resize((size_t) pos);
         for (size_t i = 0; i < (size_t) pos; ++i)
             ctoks[i] = toks[i] < pk.eg_vocab ? pk.eg_map[(size_t) toks[i]] : 0;
-        ck[0].pos = ck[1].pos = -1;   // (the checkpoints hold the state this one replaced)
+        for (int k = 0; k < 3; ++k) ck[k] = std::move(got[k]);   // (the slot's own; the old ones held the state
+                                                               // this one replaced)
         slot_held = false;
         ok = true;
         return true;
@@ -5735,7 +5833,7 @@ struct Model::Impl {
             return ec ? 0ull : (unsigned long long) s;
         };
         std::ostringstream id;
-        id << "maya-ds4-session-1 engine=" << STRATA_VERSION << " mtp=" << g.n_mtp << " dim=" << g.dim << " hd=" << g.hd
+        id << "maya-ds4-session-2 engine=" << STRATA_VERSION << " mtp=" << g.n_mtp << " dim=" << g.dim << " hd=" << g.hd
            << " win=" << g.win << " ratios=";
         for (int r : g.ratios) id << r << ",";
         id << " kv=";
@@ -11280,6 +11378,8 @@ const std::vector<int32_t>& Model::tokens() const { return p_->toks; }
 void Model::reset() { p_->reset(); }
 void Model::checkpoint(int slot) { p_->checkpoint(slot); }
 bool Model::restore(int64_t limit) { return p_->restore(limit); }
+void Model::pin() { p_->pin(); }
+std::vector<int64_t> Model::check_positions() const { return p_->check_positions(); }
 int64_t Model::restorable(int64_t limit) const { return p_->restorable(limit); }
 uint64_t Model::slot_save(std::vector<uint8_t>& out, std::string& err) { return p_->slot_save(out, err); }
 bool Model::slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err) {

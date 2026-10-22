@@ -147,6 +147,11 @@ public:
     void checkpoint(int slot = 0);
     bool restore(int64_t limit);
     int64_t restorable(int64_t limit) const;
+    /// Checkpoint 1 also becomes the anchor (kept until a restore goes before it): the position before the end of the
+    /// first prompt of a run that continued in place, where a re-rendered history (earlier reasoning dropped) splits.
+    void pin();
+    /// The positions restore() can go back to, latest first (a slot keeps them: it can be taken back at any of them).
+    std::vector<int64_t> check_positions() const;
 
     /// The conversation in the model into `out` (slot_save): its position, its tokens, every window ring (the DSpark
     /// blocks' included), the compressors' partial groups and each KV source's compressed KV and index keys up to it,

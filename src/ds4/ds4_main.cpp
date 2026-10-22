@@ -403,11 +403,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::string path;                            // empty: the state is in data (RAM)
         uint64_t bytes = 0, used = 0;
         std::shared_ptr<std::vector<uint8_t>> data;   // the RAM slot's bytes (null: a file slot)
+        std::vector<int64_t> cks;                     // the positions short of its end it can be taken back at
     };
     std::vector<Slot> slots;
     uint64_t slot_clock = 0, slot_seq = 0;
     const std::string slot_identity = m.slot_identity();
-    constexpr uint64_t kMetaMagic = 0x314154454d345344ull;   // "DS4META1" (little endian)
+    constexpr uint64_t kMetaMagic = 0x324154454d345344ull;   // "DS4META2" (little endian)
     const auto note = [&](const std::string& msg) {
         std::fprintf(stderr, "ds4 slots: %s\n", msg.c_str());
         std::printf("NOTE sessions: %s\n", msg.c_str());
@@ -419,7 +420,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         return std::string(s);
     };
     const auto meta_of = [](const std::string& bin) { return bin.substr(0, bin.size() - 4) + ".meta"; };
-    const auto meta_write = [&](const std::string& path, const std::vector<int32_t>& toks, uint64_t bytes) -> bool {
+    const auto meta_write = [&](const std::string& path, const std::vector<int32_t>& toks, uint64_t bytes,
+                                const std::vector<int64_t>& cks) -> bool {
         const std::string tmp = path + ".tmp";
         {
             std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
@@ -430,6 +432,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             f.write((const char*) &bytes, 8);
             f.write((const char*) &nt, 8);
             f.write((const char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t)));
+            const uint64_t nc = cks.size();
+            f.write((const char*) &nc, 8);
+            f.write((const char*) cks.data(), (std::streamsize) (nc * sizeof(int64_t)));
             f.write((const char*) &kMetaMagic, 8);
             f.flush();
             if (!f) return false;
@@ -439,9 +444,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         return !ec;
     };
     // a .meta of this model -> its tokens and the slot's size (false: foreign, damaged or not this model's)
-    const auto meta_read = [&](const std::string& path, std::vector<int32_t>& toks, uint64_t& bytes) -> bool {
+    const auto meta_read = [&](const std::string& path, std::vector<int32_t>& toks, uint64_t& bytes,
+                               std::vector<int64_t>& cks) -> bool {
         std::ifstream f(path, std::ios::binary);
-        uint64_t m0 = 0, il = 0, nt = 0, m1 = 0;
+        uint64_t m0 = 0, il = 0, nt = 0, nc = 0, m1 = 0;
         if (!f.read((char*) &m0, 8) || m0 != kMetaMagic || !f.read((char*) &il, 8) || il != slot_identity.size())
             return false;
         std::string id(il, '\0');
@@ -449,8 +455,15 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         if (!f.read((char*) &bytes, 8) || !f.read((char*) &nt, 8) || nt == 0 || nt > (uint64_t) m.max_context())
             return false;
         toks.resize(nt);
-        return (bool) f.read((char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t))) && f.read((char*) &m1, 8) &&
-               m1 == kMetaMagic;
+        if (!f.read((char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t))) || !f.read((char*) &nc, 8) || nc > 3)
+            return false;
+        cks.resize(nc);
+        if (!f.read((char*) cks.data(), (std::streamsize) (nc * sizeof(int64_t))) || !f.read((char*) &m1, 8) ||
+            m1 != kMetaMagic)
+            return false;
+        for (int64_t c : cks)
+            if (c <= 0 || (uint64_t) c > nt) return false;
+        return true;
     };
     const auto slot_age_days = [](const std::string& p) {
         std::error_code ec;
@@ -531,7 +544,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
         }
         fs::rename(path + ".tmp", path, ec);
-        if (ec || !meta_write(meta_of(path), s.tokens, s.data->size())) {
+        if (ec || !meta_write(meta_of(path), s.tokens, s.data->size(), s.cks)) {
             std::filesystem::remove(path + ".tmp", ec);
             std::filesystem::remove(path, ec);
             std::fprintf(stderr, "ds4 slots: writing %s failed\n", path.c_str());
@@ -561,7 +574,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         for (size_t i = slots.size(); i-- > 0;)   // an earlier state of this conversation is superseded
             if (slots[i].tokens.size() <= t.size() && std::equal(slots[i].tokens.begin(), slots[i].tokens.end(), t.begin()))
                 slot_drop(i);
-        slots.push_back({t, "", bytes, ++slot_clock, nullptr});
+        slots.push_back({t, "", bytes, ++slot_clock, nullptr, m.check_positions()});
         slots.back().data = buf;
         while (true) {   // past the cap: the least recently used conversation in RAM to the folder, or gone
             int ram = 0, disk = 0;
@@ -582,25 +595,36 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                       slot_dir.string().c_str());
         note(msg);
     };
-    // the longest kept conversation this prompt continues - past `floor` tokens, the one the model itself can go back
-    // to - back in the model: the tokens it covers (0: none)
-    const auto slot_take = [&](const std::vector<int>& prompt, size_t floor) -> size_t {
-        if (slot_max <= 0) return 0;
+    // the kept conversation this prompt shares the most of - past `floor` tokens, what the model itself can go back
+    // to - back in the model: the tokens it covers (0: none).  A conversation the prompt continues whole comes back
+    // whole (`whole`); one it leaves part way - a retried prompt, a history the client renders again without the
+    // earlier reasoning - comes back at its latest checkpoint the prompt still agrees with (the end of a prompt, the
+    // position before it, the anchor where its run of continued prompts began).
+    const auto slot_take = [&](const std::vector<int>& prompt, size_t floor, bool& whole) -> size_t {
+        whole = false;
+        if (slot_max <= 0 || prompt.size() < 2) return 0;
         size_t best = SIZE_MAX, len = 0;
         for (size_t i = 0; i < slots.size(); ++i) {
             const auto& t = slots[i].tokens;
-            if (t.size() > len && t.size() > floor && t.size() < prompt.size() &&
-                std::equal(t.begin(), t.end(), prompt.begin())) {
+            const size_t lim = std::min(t.size(), prompt.size() - 1);   // (a prompt always reads its last token)
+            size_t c = 0;
+            while (c < lim && t[c] == prompt[c]) ++c;
+            size_t u = c == t.size() ? c : 0;
+            if (u == 0)
+                for (int64_t k : slots[i].cks)
+                    if ((size_t) k <= c && (size_t) k > u) u = (size_t) k;
+            if (u > len && u > floor) {
                 best = i;
-                len = t.size();
+                len = u;
             }
         }
         if (best == SIZE_MAX) return 0;
+        const size_t whole_len = slots[best].tokens.size();
         const auto t0 = std::chrono::steady_clock::now();
         const bool ram = slots[best].data != nullptr;
         std::string e;
         bool back = false;
-        if (ram) back = m.slot_load(slots[best].data->data(), slots[best].data->size(), (int64_t) len, e);
+        if (ram) back = m.slot_load(slots[best].data->data(), slots[best].data->size(), (int64_t) whole_len, e);
         else {
             std::ifstream f(slots[best].path, std::ios::binary);
             std::vector<uint8_t> file;
@@ -610,7 +634,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 f.seekg(0, std::ios::beg);
                 if (n > 0) {
                     file.resize((size_t) n);
-                    if (f.read((char*) file.data(), n)) back = m.slot_load(file.data(), file.size(), (int64_t) len, e);
+                    if (f.read((char*) file.data(), n))
+                        back = m.slot_load(file.data(), file.size(), (int64_t) whole_len, e);
                     else e = "reading " + slots[best].path + " failed";
                 } else e = slots[best].path + " is empty";
             } else e = "cannot read " + slots[best].path;
@@ -621,14 +646,22 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             slot_drop(best);
             return 0;
         }
+        if (len < whole_len && !(m.restore((int64_t) len) && (size_t) m.pos() == len)) {
+            note("going back to token " + std::to_string(len) + " of a kept conversation failed - reading its prompt again");
+            m.reset();
+            return 0;
+        }
+        whole = len == whole_len;
         slots[best].used = ++slot_clock;
         if (!ram) {   // its age counts from its last use (a file slot's only)
             std::error_code ec;
             fs::last_write_time(meta_of(slots[best].path), fs::file_time_type::clock::now(), ec);
         }
-        char msg[192];
-        std::snprintf(msg, sizeof msg, "took back a %zu-token conversation from %s (%.1f s); %zu new tokens to read",
-                      len, ram ? "RAM" : "the folder",
+        char msg[256];
+        std::string part;
+        if (!whole) part = " at token " + std::to_string(len) + " of " + std::to_string(whole_len);
+        std::snprintf(msg, sizeof msg, "took back a %zu-token conversation%s from %s (%.1f s); %zu new tokens to read",
+                      len, part.c_str(), ram ? "RAM" : "the folder",
                       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
                       prompt.size() - len);
         note(msg);
@@ -648,6 +681,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 std::string bin;
                 std::vector<int32_t> toks;
                 uint64_t bytes;
+                std::vector<int64_t> cks;
                 fs::file_time_type t;
             };
             std::vector<Found> found;
@@ -663,9 +697,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 }
                 if (!is_meta) continue;      // a .bin is judged by its .meta
                 const std::string bin = p.substr(0, p.size() - 5) + ".bin";
-                Found fd{bin, {}, 0, fs::last_write_time(de.path(), ec)};
+                Found fd{bin, {}, 0, {}, fs::last_write_time(de.path(), ec)};
                 const uint64_t have = fs::exists(bin, ec) ? (uint64_t) fs::file_size(bin, ec) : 0;
-                if (meta_read(p, fd.toks, fd.bytes) && have == fd.bytes && fd.bytes > 0 && slot_age_days(p) <= slot_days)
+                if (meta_read(p, fd.toks, fd.bytes, fd.cks) && have == fd.bytes && fd.bytes > 0 && slot_age_days(p) <= slot_days)
                     found.push_back(std::move(fd));
                 else {
                     ++refused;
@@ -683,7 +717,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             uint64_t total = 0;
             for (auto& fd : found) {
                 total += fd.bytes;
-                slots.push_back({std::move(fd.toks), fd.bin, fd.bytes, ++slot_clock, nullptr});
+                slots.push_back({std::move(fd.toks), fd.bin, fd.bytes, ++slot_clock, nullptr, std::move(fd.cks)});
             }
             std::string msg = "folder " + slot_dir.string() + ": " + std::to_string(slots.size()) +
                               " conversation(s) kept from earlier runs (" + gb(total) + ")";
@@ -750,11 +784,14 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         for (const Pic& q : held)
             if ((size_t) q.start < c && !same(pics, q)) c = (size_t) q.start;
         size_t from = 0;
-        bool took = false;
+        bool took = false, continued = false;   // (continued: the conversation goes on - its anchor stays)
         // the conversation continues, reused in place - a conversation has to be in the model first: a fresh engine
         // (the start of a run, so every restart) holds 0 tokens, and every prompt "continues" that to token 0; taken
         // as a continuation, the take below would never run for the folder's conversations, the case they are for
-        if (n_state > 0 && c == n_state && n_state < r.ids.size()) from = n_state;
+        if (n_state > 0 && c == n_state && n_state < r.ids.size()) {
+            from = n_state;
+            continued = true;
+        }
         else {
             // CONVERSATION SLOTS: this prompt does not continue the conversation in the model - that one is set aside
             // first (another one takes the model, and its state is lost otherwise), then the kept conversation this
@@ -762,10 +799,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             if (held.empty()) slot_put("");
             const int64_t limit = (int64_t) std::min(c, r.ids.size() - 1);
             const int64_t rs = m.restorable(limit);
-            const size_t back = pics.empty() ? slot_take(r.ids, rs > 0 ? (size_t) rs : 0) : 0;
+            bool whole = false;
+            const size_t back = pics.empty() ? slot_take(r.ids, rs > 0 ? (size_t) rs : 0, whole) : 0;
             if (back > 0) {
                 from = back;
                 took = true;
+                continued = whole;
             } else if (rs >= 0 && m.restore(limit))
                 from = (size_t) m.pos();
             else m.reset();
@@ -879,6 +918,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         }
         held = std::move(pics);
         m.checkpoint(0);
+        if (!continued) m.pin();   // (a new run of prompts: where it may be rendered again from)
         const double t1 = now_ms();
         const strata::ds4::Stats sd = m.stats();   // (the decode's own counters: STAT lines, DONE's hit fields)
         long long produced = 0;
