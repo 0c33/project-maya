@@ -247,6 +247,10 @@ struct Req {
     // (-1: the whole context, which the engine caps at its window; 0: none)
     int pen_n = 0;
     float pen_repeat = 1.0f, pen_freq = 0.0f, pen_present = 0.0f;
+    // the thinking budget (think_budget=<n> think_end=<id>, the server's run config `thinking_budget`): a reasoning
+    // block still open after n tokens of the answer is closed - its next token is think_end - and the answer follows
+    long long think_budget = 0;
+    int think_end = -1;
     std::string file;   // GENI: the pictures
     std::vector<int> ids;
 };
@@ -348,6 +352,8 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "penalty_repeat") r.pen_repeat = std::strtof(v.c_str(), nullptr);
         else if (k == "penalty_freq") r.pen_freq = std::strtof(v.c_str(), nullptr);
         else if (k == "penalty_present") r.pen_present = std::strtof(v.c_str(), nullptr);
+        else if (k == "think_budget") r.think_budget = std::atoll(v.c_str());
+        else if (k == "think_end") r.think_end = std::atoi(v.c_str());
     }
     return !r.ids.empty() && (!geni || !r.file.empty());
 }
@@ -990,6 +996,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
             std::printf("%s\n", out.c_str());
         };
+        // (#363: the budget was the GLM engine's only - DeepSeek reasoned past it to max_tokens.  A round never runs
+        //  past the budget, and the round at it is a plain step whose next token, not fed yet, becomes think_end)
+        bool in_think = r.think_budget > 0 && r.think_end >= 0;
         for (;;) {
             if (in.stop.load()) {
                 finish = "cancel";
@@ -997,6 +1006,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
             std::printf("T %d\n", tok);
             ++produced;
+            if (in_think && tok == r.think_end) in_think = false;   // (closed: by the model, or by the budget)
             if (produced % 8 == 0) stat_line();
             std::fflush(stdout);
             bool end = false;
@@ -1007,7 +1017,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
             if (produced >= limit || m.pos() >= m.max_context()) break;
             if (got.empty()) {   // the next round: the drafts (if any) and the token after them
-                const int room = (int) std::min<long long>(limit - produced, m.max_context() - m.pos());
+                int room = (int) std::min<long long>(limit - produced, m.max_context() - m.pos());
+                const bool close_think = in_think && produced >= r.think_budget;
+                if (close_think) room = 1;
+                else if (in_think) room = (int) std::min<long long>(room, r.think_budget - produced);
                 int off = 0, acc = 0;
                 // a round whose drafts were all below the confidence floor: the next one does without the drafter
                 // (a request's spec / dspark_conf keys over the engine's: the speed calibration measures both ways)
@@ -1022,6 +1035,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 d_off += off;
                 d_acc += acc;
                 cool = try_spec && off == 0;
+                if (close_think && !got.empty()) got.back() = r.think_end;   // (room 1: one token, not fed yet)
                 std::reverse(got.begin(), got.end());
                 dump_rows();
             }

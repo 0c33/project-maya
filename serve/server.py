@@ -4111,8 +4111,11 @@ def main() -> int:
         except ValueError as e:
             raise SystemExit(f"[maya] config reasoning_effort: {e}")
         svc.default_effort = cfg["reasoning_effort"]
-        print(f"[maya] thinking level when a request names none: {effort_level(svc.default_effort) or 'none'}"
-              f"{'' if effort_level(svc.default_effort) == svc.default_effort else f' (the config says {svc.default_effort})'}",
+        # (#363: DeepSeek's 1..100 budget is a level of its own - it was shown as "none")
+        level = effort_level(svc.default_effort) or (f"{svc.default_effort} of 100" if type(svc.default_effort) is int
+                                                     else "none")
+        print(f"[maya] thinking level when a request names none: {level}"
+              f"{'' if level in (svc.default_effort, f'{svc.default_effort} of 100') else f' (the config says {svc.default_effort})'}",
               flush=True)
     svc.think_budget = int(cfg.get("thinking_budget", 32768) or 0) if svc.think_end_id is not None else 0
     svc.idle_unload_s = max(0.0, a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0))
