@@ -34,6 +34,10 @@
 #include <vector>
 #if defined(_WIN32)
 #include <io.h>
+#define NOMINMAX
+#include <windows.h>
+#include <timeapi.h>
+#pragma comment(lib, "winmm.lib")
 #else
 #include <unistd.h>
 #include <cerrno>
@@ -651,6 +655,16 @@ int main(int argc, char** argv) {
         setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8", 0);
 #endif
     }
+#if defined(_WIN32)
+    // Windows sleeps in 15.6 ms ticks unless a process asks for finer ones: the CPU lane's service thread naps
+    // (sleep_for 20 us) between tokens, and the device's first wait of the next token then waits out the tick.
+    // MAYA_DS4_TIMER_MS=0: leave the system's resolution alone.
+    {
+        const char* v = std::getenv("MAYA_DS4_TIMER_MS");
+        const int ms = v != nullptr ? std::atoi(v) : 1;
+        if (ms > 0) timeBeginPeriod((UINT) ms);
+    }
+#endif
     strata::ds4::Options o;
     std::string ids_s, dump, eos = "1", ppl;
     int n = 0, window = 16;

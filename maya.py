@@ -434,9 +434,9 @@ DS4_VISION_MIN_CC = 80                             # the vision tower's BF16 GEM
 # shards + unsloth's MXFP8 shard of the Engram tables in <...-GGUF>/Engram), unsloth's GGUFs before their re-shard.
 DS4_GGUF_MANIFEST = ROOT / "tools" / "ds4" / "download_gguf.json"
 DS4_GGUF_PACK_TOOLS = ("tools/ds4/pack_gguf.py", "tools/ds4/chat_template.jinja")
-DS4_QUANTS = {"gguf-q8": "UD-Q8_K_XL", "gguf-q4": "UD-Q4_K_XL", "maya-s": "Maya-S", "maya-m": "Maya-M",
+DS4_QUANTS = {"gguf-q8": "UD-Q8_K_XL", "gguf-q4": "UD-Q4_K_XL", "maya-s": "Maya-S", "maya-m": "Maya-M", "maya-xs": "Maya-XS",
               "exl3": "EXL3 2.9bpw", "exl3-3.5": "EXL3 3.5bpw"}
-DS4_MAYA = ("maya-s", "maya-m")
+DS4_MAYA = ("maya-s", "maya-m", "maya-xs")
 DS4_DEFAULT_QUANT = "gguf-q8"
 DS4_GGUF_MIN_CC = 70
 DS4_CONTEXTS = [32768, 65536, 131072, 262144]
@@ -3492,10 +3492,35 @@ def ds4_maya_drafter_model() -> dict | None:
             "download_gb": sum(v[0] for v in files.values()) / 1e9}
 
 
-def ds4_drafter_step(a, d: Path) -> bool:
+def ds4_quant_drafter(quant: str) -> dict | None:
+    """A Maya quant's own DSpark drafter (download_gguf.json's maya / quants / <quant> / "drafter": e.g. Maya-XS's, its
+    experts in 2 bits) as offer_download's form plus "json" (its .json's name in dspark/), or None: the shared one."""
+    if quant not in DS4_MAYA:
+        return None
+    my = read_json(DS4_GGUF_MANIFEST).get("maya") or {}
+    dr = ((my.get("quants") or {}).get(DS4_QUANTS[quant]) or {}).get("drafter") or {}
+    if not dr.get("files") or not dr.get("json"):
+        return None
+    files = {Path(k).name: v for k, v in dr["files"].items()}
+    return {"about": f"{DS4_QUANTS[quant]}'s DSpark drafter ({dr.get('about', 'its own formats')})",
+            "format": "ds4-drafter", "repo": my["repo"], "revision": my["revision"], "folder": "dspark",
+            "files": {k: v[0] for k, v in files.items()}, "sha256": {k: v[1] for k, v in files.items()},
+            "download_gb": sum(v[0] for v in files.values()) / 1e9, "json": dr["json"]}
+
+
+def ds4_drafter_step(a, d: Path, quant: str | None = None) -> bool:
     """The DSpark drafter in d (beside the GGUFs' folders, shared by both): downloaded when it is not there, then made
-    the GGUF path's formats (tools/ds4/drafter_pack.py: dspark.bin) - its three shards are removed after that.  False:
-    not there (not downloaded): the model runs without it."""
+    the GGUF path's formats (tools/ds4/drafter_pack.py: dspark.bin) - its three shards are removed after that.  A quant
+    with its own drafter (ds4_quant_drafter) gets that one instead.  False: not there (not downloaded): the model runs
+    without it."""
+    own = ds4_quant_drafter(quant) if quant else None
+    if own is not None:
+        want = [d / n for n in own["files"]]
+        if any(file_incomplete(own, f) for f in want) and not offer_download(a, "the DSpark drafter", d, want, own):
+            warn("the DSpark drafter was not downloaded: the model runs without it")
+            return False
+        ok(f"the DSpark drafter: {d / own['json']}")
+        return True
     if (d / "dspark.bin").is_file() and (d / "dspark.json").is_file():
         ok(f"the DSpark drafter: {d / 'dspark.bin'}")
         return True
@@ -3621,6 +3646,8 @@ def choose_ds4_quant(a, prev: dict) -> str:
     gb = {k: ds4_gguf_model(k)["download_gb"] for k in maya}
     label = {"maya-s": (f"Maya-S ({gb.get('maya-s', 0):.0f} GB)", "Maya's quant: experts in 2-3 bits, the most of it in memory"),
              "maya-m": (f"Maya-M ({gb.get('maya-m', 0):.0f} GB)", "Maya's quant: experts in 3.4 bits, closer to the original"),
+             "maya-xs": (f"Maya-XS ({gb.get('maya-xs', 0):.0f} GB, experimental)",
+                         "Maya's smallest quant: experts in ~1.6 bits, the whole model in a 128 GB PC's memory"),
              "gguf-q8": ("GGUF UD-Q8_K_XL (508 GB)", "dense weights BF16, experts MXFP4 (DeepSeek's own formats)"),
              "gguf-q4": ("GGUF UD-Q4_K_XL (501 GB)", "dense weights Q8_0 (less VRAM), experts MXFP4"),
              "exl3": ("EXL3 2.9 bits (414 GB)", "with the DSpark drafter and the vision tower"),
@@ -3733,7 +3760,7 @@ def ds4_model_step(a, d: Path, m: dict):
 
 
 def ds4_pack_step(a, d: Path, gguf: bool = False, announce: bool = True, engram: Path | None = None,
-                  files: list | None = None) -> Path:
+                  files: list | None = None, drafter: Path | None = None) -> Path:
     """tools/ds4/pack.py's pack in <model>/maya-ds4: the geometry, where every tensor sits in the safetensors (read
     in place), the Engram hash tables and the tokenizer - built again when its tools or the model's files changed, or
     (a GGUF) when the drafter or the vision tower arrived after it.  announce=False: no step heading (step 7 adds the
@@ -3748,7 +3775,7 @@ def ds4_pack_step(a, d: Path, gguf: bool = False, announce: bool = True, engram:
     shards = list(files) if gguf and files else ds4_shards(d)
     if gguf and engram is not None:                    # (v1.1.16's Maya-S: its Engram tables are beside it)
         shards += sorted(engram.glob("*.gguf"))
-    drafter_new = gguf and (d.parent / "dspark" / "dspark.json").is_file() and not CDS.has_drafter(
+    drafter_new = gguf and (drafter or d.parent / "dspark" / "dspark.json").is_file() and not CDS.has_drafter(
         {"args": ["--pack", str(pack)]})               # (the drafter arrived after the pack was built)
     vision_new = gguf and (ds4_vision_dir(d) / "vision.json").is_file() and not ds4_pack_has_vision(pack)
     if not a.repack and read_json(pack / PACK_SOURCES).get("tools") == tools and not drafter_new and \
@@ -3763,6 +3790,7 @@ def ds4_pack_step(a, d: Path, gguf: bool = False, announce: bool = True, engram:
     run([sys.executable, str(ROOT / "tools" / "ds4" / ("pack_gguf.py" if gguf else "pack.py")), "--model", str(d),
          "--out", str(pack)] + (["--vision", str(ds4_vision_dir(d))] if gguf else []) +
         (["--engram", str(engram)] if gguf and engram is not None else []) +
+        (["--drafter", str(drafter)] if gguf and drafter is not None else []) +
         (["--shards"] + [Path(f).name for f in files] if gguf and files else []))
     missing = [f for f in need if not (pack / f).exists()]
     if missing:
@@ -3880,12 +3908,14 @@ def set_up_ds4(a, prev: dict) -> Path | None:
     if gguf and old is None:
         ds4_unused(m, d)
     engram = old and old["engram"]                     # (v1.1.16's Maya-S: its Engram tables beside it)
-    drafter = gguf and ds4_drafter_step(a, d.parent / "dspark")   # (the EXL3 quant has its own)
-    pack = ds4_pack_step(a, d, gguf, engram=engram, files=files)   # 6
+    drafter = gguf and ds4_drafter_step(a, d.parent / "dspark", quant)   # (the EXL3 quant has its own)
+    own = ds4_quant_drafter(quant) if gguf else None   # (Maya-XS: its own drafter beside the shared one)
+    dj = d.parent / "dspark" / own["json"] if own is not None and drafter else None
+    pack = ds4_pack_step(a, d, gguf, engram=engram, files=files, drafter=dj)   # 6
     if gguf:                                           # 7 (DeepSeek's checkpoint's tower, added to the pack)
         vision = ds4_vision_step(a, pc, d)
         if vision and not ds4_pack_has_vision(pack):
-            pack = ds4_pack_step(a, d, gguf, announce=False, engram=engram, files=files)
+            pack = ds4_pack_step(a, d, gguf, announce=False, engram=engram, files=files, drafter=dj)
         vision = vision and ds4_pack_has_vision(pack)
     else:
         step(7, "images (the vision tower)")
@@ -3944,7 +3974,8 @@ def main() -> int:
                                         "must be writable - the pack is written inside it")
     ap.add_argument("--ds4-quant", choices=list(DS4_QUANTS),
                     help=f"{DS4}'s files: maya-s = Maya's quant (the experts in 2-3 bits; the default once "
-                         "published; maya-m: 3.4 bits, once published), gguf-q8 = unsloth's UD-Q8_K_XL GGUF, gguf-q4 = its UD-Q4_K_XL "
+                         "published; maya-m: 3.4 bits, once published; maya-xs: ~1.6 bits, experimental, with its own "
+                         "2-bit drafter: the whole model in a 128 GB PC's memory), gguf-q8 = unsloth's UD-Q8_K_XL GGUF, gguf-q4 = its UD-Q4_K_XL "
                          "(dense weights Q8_0: less VRAM), exl3 = LibertAIDAI's EXL3 quant at 2.9 bits, exl3-3.5 = its "
                          "3.5-bit quant (closer to the original; ~280 GB of VRAM + RAM; both V100 or newer)")
     ap.add_argument("--draft", choices=list(DRAFTS),
