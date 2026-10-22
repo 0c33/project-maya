@@ -256,8 +256,10 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
                 served += 1
                 rows.append([t.name, "0", "0", "0", "0", "0", "0", str(ne0), str(ne1), "8", "0", "32"] + ["0"] * 7)
     if dropped:
-        print("NextN/MTP: dropped %d tensors of blk.%d+ (the runner skips MTP; re-pack when a "
-              "GLM5-Next draft graph exists)" % (dropped, block_count))
+        # (#327: "the runner skips MTP" read as drafting off - it is not: the engine reads the block from the model's
+        #  files itself)
+        print("NextN/MTP: %d tensors of blk.%d+ left out of the pack - the engine reads the MTP draft block from the "
+              "model's files itself" % (dropped, block_count))
     write_index(out, rows, src, served, 0)
     if compat_bf16:
         (out / "compat-bf16.json").write_text(json.dumps({
