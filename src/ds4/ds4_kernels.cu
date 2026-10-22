@@ -1110,18 +1110,22 @@ __global__ void __launch_bounds__(1024) topk_seg_kernel(const float* __restrict_
 }
 // the merge: only the segments' picks at or above the largest segment's k-th (the row's k-th is at least that) - into
 // shared memory in position order, then topk_block over them (all of the candidates when more than kMergeCap pass: with
-// 16K-position segments ~3% of a row pass, 8192 of them past 256K positions)
+// 16K-position segments ~3% of a row pass, 8192 of them past 256K positions).  The cap a device takes leaves 4 KB of
+// its shared memory a block for the kernel's own (~2 KB: its offsets, topk_block's histogram): 64 KB a block (AMD,
+// Turing) gives 7680, 96 KB+ the full 8192 - 8192 x 8 bytes on a 64 KB device failed the launch ("invalid argument"
+// from 32,768 positions on, the first rows long enough for the segments).  A smaller cap only sends rows with more
+// candidates to the all-candidates way: the same picks.
 constexpr int kMergeCap = 8192;
 __global__ void __launch_bounds__(1024) topk_merge_kernel(Rows r, int P, int K, const float* __restrict__ sv,
                                                           const int* __restrict__ si, const int* __restrict__ sn,
                                                           const uint32_t* __restrict__ sk, const int* __restrict__ cand,
                                                           int cand_stride, int blk, int* __restrict__ out,
-                                                          int out_stride) {
+                                                          int out_stride, int cap) {
     __shared__ int off[kTopkSegMax + 1];
     __shared__ uint32_t floor_s;
-    extern __shared__ __align__(16) uint8_t merge_smem[];   // [kMergeCap] values, then [kMergeCap] positions
+    extern __shared__ __align__(16) uint8_t merge_smem[];   // [cap] values, then [cap] positions
     float* mv = (float*) merge_smem;
-    int* mi = (int*) (merge_smem + (size_t) kMergeCap * 4);
+    int* mi = (int*) (merge_smem + (size_t) cap * 4);
     __shared__ int warp_n[32], base_n;
     const int t = blockIdx.x;
     int n, k;
@@ -1164,11 +1168,11 @@ __global__ void __launch_bounds__(1024) topk_merge_kernel(Rows r, int P, int K, 
                 tot += warp_n[w];
             }
             const int at = b + __popc(m & ((1u << lane) - 1u));
-            if (keep && at < kMergeCap) mv[at] = x, mi[at] = ci[(size_t) p * K + j];
+            if (keep && at < cap) mv[at] = x, mi[at] = ci[(size_t) p * K + j];
             __syncthreads();
             if (threadIdx.x == 0) base_n += tot;
             __syncthreads();
-            if (base_n > kMergeCap) {
+            if (base_n > cap) {
                 fits = false;
                 break;
             }
@@ -2699,15 +2703,19 @@ void topk(const float* vals, long long stride, int T, const Rows& r, const int* 
         if (nmax >= kTopkSegMin && kmax <= sc->K) {
             const int P = std::min(sc->P, std::max(2, (nmax + kTopkSeg - 1) / kTopkSeg));
             topk_seg_kernel<<<dim3(P, T), 1024, 0, s>>>(vals, stride, r, P, sc->K, sc->val, sc->idx, sc->cnt, sc->kth);
-            static std::atomic<uint64_t> big_smem{0};   // (the devices the merge's shared memory was opted in on)
+            static std::atomic<int> merge_cap[64];   // (each device's cap, its shared memory opted in; 0: not yet)
             int dev = 0;
             cudaGetDevice(&dev);
-            if (!(big_smem.load(std::memory_order_relaxed) >> dev & 1u)) {
-                cudaFuncSetAttribute(topk_merge_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kMergeCap * 8);
-                big_smem.fetch_or(1ull << dev);
+            int cap = merge_cap[dev & 63].load(std::memory_order_relaxed);
+            if (cap == 0) {
+                int optin = 0;
+                cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+                cap = std::max(1024, std::min(kMergeCap, (optin - 4096) / 8)) & ~31;
+                cudaFuncSetAttribute(topk_merge_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, cap * 8);
+                merge_cap[dev & 63].store(cap, std::memory_order_relaxed);
             }
-            topk_merge_kernel<<<T, 1024, (size_t) kMergeCap * 8, s>>>(r, P, sc->K, sc->val, sc->idx, sc->cnt, sc->kth, cand,
-                                                                      cand_stride, blk, out, out_stride);
+            topk_merge_kernel<<<T, 1024, (size_t) cap * 8, s>>>(r, P, sc->K, sc->val, sc->idx, sc->cnt, sc->kth, cand,
+                                                                cand_stride, blk, out, out_stride, cap);
             return;
         }
     }
