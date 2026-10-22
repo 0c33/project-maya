@@ -1398,7 +1398,19 @@ __global__ void __launch_bounds__(kThreads) unpack_sel_kernel(const uint8_t* __r
     unpack32(ckv + (size_t) sel[(size_t) t * sel_stride + i] * kv_row_bytes(kKvFp4, 512), part, (uint4*) (out + r * 512 + part * 32));
 }
 
-template <int G>
+// Permute 16-byte vectors within each row. Both staging and consuming accesses
+// use this bijection; values, reduction order and the LDS footprint are unchanged.
+template <bool Swizzle>
+__device__ __forceinline__ int attn_tile_offset(int row, int col) {
+    if constexpr (Swizzle) {
+        const int v = col >> 3;
+        const int p = ((v >> 2) | ((v & 3) << 4)) ^ ((v & 3) << 1);
+        return row * 512 + p * 8 + (col & 7);
+    }
+    return row * 512 + col;
+}
+
+template <int G, bool Swizzle = false>
 __global__ void __launch_bounds__(kThreads) sparse_attn_packed_kernel(const float* __restrict__ q,
                                                                       const uint16_t* __restrict__ win,
                                                                       const uint8_t* __restrict__ ckv,
@@ -1441,6 +1453,20 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_packed_kernel(const floa
     auto stage = [&](int t0, int s0, int n) {
         if (sr >= n) return;
         const int j = s0 + sr;
+        if constexpr (Swizzle) {
+            uint4 decoded[4];
+            if (t0 + j < n_win) {
+                const uint4* src = (const uint4*) (rows[j] + part * 64);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) decoded[i] = src[i];
+            } else {
+                unpack32(rows[j], part, decoded);
+            }
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                *(uint4*) (tile + attn_tile_offset<true>(sr, part * 32 + i * 8)) = decoded[i];
+            return;
+        }
         uint4* dst = (uint4*) (tile + sr * d + part * 32);
         if (t0 + j < n_win) {   // a window row: BF16 already
             const uint4* src = (const uint4*) (rows[j] + part * 64);
@@ -1468,9 +1494,9 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_packed_kernel(const floa
 #pragma unroll 2
 #endif
             for (int r = wr; r < n; r += W) {   // (two rows' chains at once)
-                const uint16_t* vr = tile + r * d + lane * 16;
+                const uint16_t* vr = tile + attn_tile_offset<Swizzle>(r, lane * 16);
                 const uint4 a = *(const uint4*) vr;
-                const uint4 b = *(const uint4*) (vr + 8);
+                const uint4 b = *(const uint4*) (tile + attn_tile_offset<Swizzle>(r, lane * 16 + 8));
                 const uint16_t* pa = (const uint16_t*) &a;
                 const uint16_t* pb = (const uint16_t*) &b;
                 float s = 0.0f;
@@ -1516,7 +1542,7 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_packed_kernel(const floa
             stage(t0, s0, n);
             __syncthreads();
             for (int r = 0; r < n; ++r) {
-                const uint32_t pr = *(const uint32_t*) (tile + r * d + c);
+                const uint32_t pr = *(const uint32_t*) (tile + attn_tile_offset<Swizzle>(r, c));
                 const float v0 = bf16f((uint16_t) (pr & 0xffffu)), v1 = bf16f((uint16_t) (pr >> 16));
 #pragma unroll
                 for (int g = 0; g < G; ++g) {
@@ -2784,6 +2810,16 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
     if (heads % G != 0) G = 1;
     const dim3 grid(heads / G, T);
     const uint8_t* c = (const uint8_t*) ckv;
+#if defined(STRATA_USE_HIP)
+    const char* swizzle = std::getenv("DS4_HIP_ATTN_SWIZZLE");
+    if (swizzle && std::atoi(swizzle) == 1) {
+        if (G == 8) sparse_attn_packed_kernel<8, true><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+        else if (G == 4) sparse_attn_packed_kernel<4, true><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+        else if (G == 2) sparse_attn_packed_kernel<2, true><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+        else sparse_attn_packed_kernel<1, true><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+        return;
+    }
+#endif
     if (G == 8) sparse_attn_packed_kernel<8><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
     else if (G == 4) sparse_attn_packed_kernel<4><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
     else if (G == 2) sparse_attn_packed_kernel<2><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
