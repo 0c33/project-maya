@@ -1566,17 +1566,40 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_packed_kernel(const floa
     }
 }
 
-// ---------------------------------------------------------------- sparse attention on RDNA 3's matrix cores
+// ---------------------------------------------------------------- sparse attention on RDNA 3 / 4's matrix cores
 // kAttnWmma: 16 heads of one query a block; each tile of 16 selected rows staged once as BF16 (as the packed kernel),
 // the dots and the weighted sums as v_wmma_f32_16x16x16_bf16 with the query and the probabilities each a BF16 high
 // and low part (two products: ~16 bits of mantissa), the rows exact.  Warp w: the dots over dimensions w * 64 .. + 64
 // (the warps' parts summed in shared memory, in warp order), the online softmax a thread a (head, row), then output
 // dimensions w * 64 .. + 64 (A: lane m and m + 16 hold head m's 16 values; B: lane n and n + 16 column n's; D's
-// element i: head 2i + lane / 16, column lane % 16).
-#if defined(STRATA_USE_HIP) && defined(__GFX11__)
+// element i: head 2i + lane / 16 on gfx11, 8 * (lane / 16) + i on gfx12; column lane % 16). gfx12 takes only
+// dimensions 8 * (lane / 16) .. + 7 of each operand, rather than gfx11's duplicated 16-value operands.
+#if defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__))
 #define DS4_ATTN_WMMA 1
 typedef short ds4_s16 __attribute__((ext_vector_type(16)));
 typedef float ds4_f8 __attribute__((ext_vector_type(8)));
+__device__ __forceinline__ ds4_f8 attn_wmma(ds4_s16 a, ds4_s16 b, ds4_f8 c) {
+#if defined(__GFX12__)
+    using s8 = short __attribute__((ext_vector_type(8)));
+    const int k0 = (threadIdx.x & 31) / 16 * 8;
+    s8 aa, bb;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        aa[i] = a[k0 + i];
+        bb[i] = b[k0 + i];
+    }
+    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(aa, bb, c);
+#else
+    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c);
+#endif
+}
+__device__ __forceinline__ int attn_wmma_row(int i, int hi) {
+#if defined(__GFX12__)
+    return 8 * hi + i;
+#else
+    return 2 * i + hi;
+#endif
+}
 #endif
 __device__ __forceinline__ uint16_t f2bf_rn(float x) {   // (round to nearest even; no NaN in these values)
     uint32_t u = __float_as_uint(x);
@@ -1667,11 +1690,11 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_wmma_kernel(const float*
                 kb[2 * e] = (short) (w[e] & 0xffffu);
                 kb[2 * e + 1] = (short) (w[e] >> 16);
             }
-            s = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(qa[kk], kb, s);
-            s = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(qb[kk], kb, s);
+            s = attn_wmma(qa[kk], kb, s);
+            s = attn_wmma(qb[kk], kb, s);
         }
 #pragma unroll
-        for (int i = 0; i < 8; ++i) sp[wp][(2 * i + hi) * R + m16] = s[i];
+        for (int i = 0; i < 8; ++i) sp[wp][attn_wmma_row(i, hi) * R + m16] = s[i];
         __syncthreads();
         {   // thread (head e / 16, row e % 16): the tile's score, the head's running max and denominator
             const int e = threadIdx.x, h = e >> 4, r = e & 15;
@@ -1707,13 +1730,13 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_wmma_kernel(const float*
 #pragma unroll
         for (int nt = 0; nt < 4; ++nt) {   // B: output dimension wp * 64 + nt * 16 + m16 of the tile's rows
 #pragma unroll
-            for (int i = 0; i < 8; ++i) acc[nt][i] *= tsc[2 * i + hi];
+            for (int i = 0; i < 8; ++i) acc[nt][i] *= tsc[attn_wmma_row(i, hi)];
             const uint16_t* vc = tile + wp * 64 + nt * 16 + m16;
             ds4_s16 vb;
 #pragma unroll
             for (int r = 0; r < R; ++r) vb[r] = (short) vc[r * d];
-            acc[nt] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(pa, vb, acc[nt]);
-            acc[nt] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(pb, vb, acc[nt]);
+            acc[nt] = attn_wmma(pa, vb, acc[nt]);
+            acc[nt] = attn_wmma(pb, vb, acc[nt]);
         }
         __syncthreads();
     }
@@ -1721,7 +1744,7 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_wmma_kernel(const float*
     for (int nt = 0; nt < 4; ++nt)
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            const int h = 2 * i + hi;
+            const int h = attn_wmma_row(i, hi);
             const float dn = den[h] + expf(sink[hb + h] - m_run[h]);
             out[((size_t) t * heads + hb + h) * d + wp * 64 + nt * 16 + m16] = acc[nt][i] / dn;
         }
@@ -2753,7 +2776,7 @@ static int sm_count() {
     return v;
 }
 
-// sparse_attn_wmma_kernel's device: an RDNA 3 GPU (gfx11), unless DS4_ATTN_WMMA=0 (cached a device)
+// sparse_attn_wmma_kernel's device: an RDNA 3 / 4 GPU (gfx11 / gfx12), unless DS4_ATTN_WMMA=0 (cached a device)
 static bool attn_wmma_now() {
 #if defined(STRATA_USE_HIP)
     static const bool off = std::getenv("DS4_ATTN_WMMA") != nullptr && std::atoi(std::getenv("DS4_ATTN_WMMA")) == 0;
@@ -2763,7 +2786,9 @@ static bool attn_wmma_now() {
     int v = known[dev].load(std::memory_order_relaxed);
     if (v == 0) {
         cudaDeviceProp p{};
-        v = cudaGetDeviceProperties(&p, dev) == cudaSuccess && std::strncmp(p.gcnArchName, "gfx11", 5) == 0 ? 2 : 1;
+        v = cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+                    (std::strncmp(p.gcnArchName, "gfx11", 5) == 0 || std::strncmp(p.gcnArchName, "gfx12", 5) == 0)
+                ? 2 : 1;
         known[dev].store(v, std::memory_order_relaxed);
     }
     return v == 2;

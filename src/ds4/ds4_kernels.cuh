@@ -167,7 +167,7 @@ struct AttnScratch {
     int max_t = 0, cap = 0;     // queries, rows a query (at least the sel_stride)
 };
 constexpr int kAttnScratchT = 7;   // (the staged kernel wins from 8 queries: V100, Sun)
-// heads_per_block kAttnWmma (a prompt chunk's queries): on RDNA 3 (gfx11) 16 heads a block on the matrix cores - the
+// heads_per_block kAttnWmma (a prompt chunk's queries): on RDNA 3/4 (gfx11/gfx12), 16 heads a block on matrix cores - the
 // products in BF16 (the query and the probabilities as a high and a low part: within rounding of the FP32 kernels,
 // not their bits); elsewhere, or DS4_ATTN_WMMA=0, as 0
 constexpr int kAttnWmma = 16;
