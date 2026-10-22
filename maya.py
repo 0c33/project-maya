@@ -3646,7 +3646,7 @@ def choose_ds4_quant(a, prev: dict) -> str:
     gb = {k: ds4_gguf_model(k)["download_gb"] for k in maya}
     label = {"maya-s": (f"Maya-S ({gb.get('maya-s', 0):.0f} GB)", "Maya's quant: experts in 2-3 bits, the most of it in memory"),
              "maya-m": (f"Maya-M ({gb.get('maya-m', 0):.0f} GB)", "Maya's quant: experts in 3.4 bits, closer to the original"),
-             "maya-xs": (f"Maya-XS ({gb.get('maya-xs', 0):.0f} GB, experimental)",
+             "maya-xs": (f"Maya-XS ({gb.get('maya-xs', 0):.0f} GB)",
                          "Maya's smallest quant: experts in ~1.6 bits, the whole model in a 128 GB PC's memory"),
              "gguf-q8": ("GGUF UD-Q8_K_XL (508 GB)", "dense weights BF16, experts MXFP4 (DeepSeek's own formats)"),
              "gguf-q4": ("GGUF UD-Q4_K_XL (501 GB)", "dense weights Q8_0 (less VRAM), experts MXFP4"),
@@ -3974,7 +3974,7 @@ def main() -> int:
                                         "must be writable - the pack is written inside it")
     ap.add_argument("--ds4-quant", choices=list(DS4_QUANTS),
                     help=f"{DS4}'s files: maya-s = Maya's quant (the experts in 2-3 bits; the default once "
-                         "published; maya-m: 3.4 bits, once published; maya-xs: ~1.6 bits, experimental, with its own "
+                         "published; maya-m: 3.4 bits, once published; maya-xs: ~1.6 bits, with its own "
                          "2-bit drafter: the whole model in a 128 GB PC's memory), gguf-q8 = unsloth's UD-Q8_K_XL GGUF, gguf-q4 = its UD-Q4_K_XL "
                          "(dense weights Q8_0: less VRAM), exl3 = LibertAIDAI's EXL3 quant at 2.9 bits, exl3-3.5 = its "
                          "3.5-bit quant (closer to the original; ~280 GB of VRAM + RAM; both V100 or newer)")

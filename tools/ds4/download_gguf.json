@@ -265,7 +265,7 @@
     "files": {}
    },
    "Maya-XS": {
-    "about": "experimental: every routed expert IQ1_S (error-feedback rounding, calibrated layer by layer on the quantized model itself), dense weights Q8_0, the Engram tables Q6_K; with its own 2-bit DSpark drafter",
+    "about": "every routed expert IQ1_S (error-feedback rounding, calibrated layer by layer on the quantized model itself), dense weights Q8_0, the Engram tables Q6_K; with its own 2-bit DSpark drafter",
     "files": {
      "Maya-XS/DeepSeek-V4.1-Flash-1017-Maya-XS-IQ1_S-00001-of-00005.gguf": [
       47781530400,
