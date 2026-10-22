@@ -178,7 +178,10 @@ def main() -> int:
                 st.t[k] = (dense.name, v["dtype"], tuple(v["shape"]), 8 + n + a, b - a)
         if dense.name not in st.files:
             st.files.append(dense.name)
-    elif any(v[1] == "F8_E4M3" and not k.startswith("vision.") and ".engram.embed." not in k for k, v in st.t.items()):
+    # (an FP8 tensor the EXL3 set also has quantized is not the pack's: the Engram tables' shards from DeepSeek's repo
+    #  carry layers.1/14.engram.wkv.weight in FP8 beside the EXL3 set's own wkv - #376)
+    elif any(v[1] == "F8_E4M3" and not k.startswith("vision.") and ".engram.embed." not in k and
+             not (k.endswith(".weight") and k[:-len("weight")] + "trellis" in st.t) for k, v in st.t.items()):
         raise SystemExit("%s keeps dense weights in FP8: python tools/ds4/fp8_dense.py --model %s first" % (model, model))
     miss = need(st, t)
     if miss:
