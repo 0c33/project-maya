@@ -4,6 +4,15 @@ Every release is on GitHub (Releases) with these notes; every published change m
 dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.23 - 2026-10-22
+
+A fix for DeepSeek conversations past 32,768 tokens on AMD GPUs and NVIDIA RTX 20 cards.
+
+- **DeepSeek past 32K tokens on AMD (Strix Halo, Radeon) and RTX 20:** since v1.1.22, once a conversation passed
+  32,768 tokens the engine stopped (`ds4 gguf mv: invalid argument`). The long-context top-k now sizes its buffer from
+  each GPU's shared memory - the same picks, the same speed. NVIDIA V100, RTX 30 and newer were not affected.
+- **Maya-XS** is no longer labelled experimental in the setup.
+
 ## v1.1.22 - 2026-10-22
 
 DeepSeek-V4.1-Flash gets Maya-XS - the whole model in a 128 GB PC's memory - tensor parallel on several GPUs, and much
