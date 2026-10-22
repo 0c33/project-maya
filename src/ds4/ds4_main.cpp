@@ -572,9 +572,20 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 out += b;
             }
             const long long io = io_read_bytes();
+            // the GLM engine's tier keys too: where the experts live (VRAM, RAM - copies or the read-ahead -, the rest on
+            // the SSD) and, a token, the CPU lane's experts from the SSD (the storage's reads over an expert's bytes, at
+            // most the CPU lane's) and from RAM (the rest of them)
+            const strata::ds4::Model::Tiers tr = m.tiers();
+            std::snprintf(b, sizeof b, " vram_used=%d ram_used=%d cpu_n=%d vram_gb=%.2f ram_gb=%.2f", tr.vram,
+                          tr.ram, tr.cpu, tr.vram_gb, tr.ram_gb);
+            out += b;
             if (io >= 0 && io_dec >= 0) {
-                std::snprintf(b, sizeof b, " disk_mb=%.3f", (double) (io - io_dec) / 1e6 / fed);
+                const double disk = tr.cpu_blob > 0 ? std::min(cx / fed, (double) (io - io_dec) / tr.cpu_blob / fed) : 0.0;
+                std::snprintf(b, sizeof b, " disk_mb=%.3f disk=%.3f ram_fetch=%.3f", (double) (io - io_dec) / 1e6 / fed,
+                              disk, std::max(0.0, cx / fed - disk));
                 out += b;
+            } else if (cx == 0) {   // (the storage's reads not measured here - but no expert ran on the CPU lane)
+                out += " disk=0 ram_fetch=0";
             }
             if (d_off > 0) {
                 std::snprintf(b, sizeof b, " drafts=%.3f", (double) d_acc / (double) d_off);

@@ -161,6 +161,14 @@ public:
     std::string describe() const;
     /// INFO / VRAM lines for the server's Monitor.
     std::vector<std::string> info_lines() const;
+    /// Where the routed experts live (the drafter's apart), for the Monitor's tiers: in VRAM; in RAM - copied there, or
+    /// read ahead into the page cache (in place); the rest read from the SSD when routed.  cpu_blob: a CPU-lane expert's
+    /// bytes on average (the SSD's reads a token -> experts a token)
+    struct Tiers {
+        int vram = 0, ram = 0, cpu = 0;
+        double vram_gb = 0, ram_gb = 0, cpu_blob = 0;
+    };
+    Tiers tiers() const;
 
     struct Impl;
 

@@ -10997,5 +10997,25 @@ void Model::save_profile() const { p_->save_profile(); }
 const Stats& Model::stats() const { return p_->st; }
 std::string Model::describe() const { return p_->describe(); }
 std::vector<std::string> Model::info_lines() const { return p_->info_lines(); }
+Model::Tiers Model::tiers() const {
+    const Impl& m = *p_;
+    Tiers t;
+    double cb = 0;
+    for (const Layer& l : m.L) {
+        if (l.mtp) continue;
+        t.vram += l.n_vram;
+        t.vram_gb += (double) l.n_vram * (double) l.blob / 1e9;
+        t.cpu += l.n_exp - l.n_vram;
+        cb += (double) (l.n_exp - l.n_vram) * (double) l.blob;
+    }
+    t.cpu_blob = t.cpu > 0 ? cb / t.cpu : 0;
+    // in RAM: the copies (copy_experts / the RAM tier); in place, the read-ahead's share of the page cache; not in
+    // place (the experts copied whole into RAM): every CPU-lane expert
+    if (m.ram_held > 0) t.ram = m.ram_held;
+    else if (m.file_experts) t.ram = t.cpu_blob > 0 ? (int) std::min<double>(t.cpu, (double) m.warm_bytes / t.cpu_blob) : 0;
+    else t.ram = t.cpu;
+    t.ram_gb = t.ram * t.cpu_blob / 1e9;
+    return t;
+}
 
 }  // namespace strata::ds4
