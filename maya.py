@@ -4080,12 +4080,9 @@ def main() -> int:
             for i, c in enumerate(have, 1):
                 say(f"  {i}) {c.name}")
             pick = have[int(ask("Which one?", [str(i) for i in range(1, len(have) + 1)], "1", a.yes)) - 1]
-        if a.speed_calibration and config_family(read_json(pick)) == "deepseek":
-            ok(f"{DS4}'s engine drafts with its DSpark block: nothing to tune here (--calibrate tunes its --tp and CPU "
-               "threads)")
-            a.speed_calibration = False
-            if a.no_start and not a.calibrate:
-                return 0
+        # (DeepSeek too: --speed-calibration measures its DSpark drafter against none - speed_calibration_ds4 - and keeps
+        #  the faster; it used to stop here with "nothing to tune", so a config the setup wrote with --dspark none until
+        #  that measurement could never get it - #393.  --calibrate tunes its --tp and CPU threads)
         if a.calibrate:
             refresh_engine(read_json(pick))            # (the engine the tuning measures is the current one)
             if not calibrate_config(pick):
