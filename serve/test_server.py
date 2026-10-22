@@ -1843,5 +1843,31 @@ class GoneClients(unittest.TestCase):
         self.assertEqual(self.engine.calls, 1)         # (neither gone request reached the engine)
 
 
+@unittest.skipIf(os.name == "nt", "a shell script stands in for the engine")
+class FailedRestartKeepsContext(unittest.TestCase):
+    """#351: an engine that died and could not start again (a GPU that fell off the bus) left max_context 0, and every
+    later request failed "exceeds the context (0)" before the next start was tried.  The context stays what it was."""
+
+    def test_failed_restart(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            gone = Path(d) / "gone"
+            exe = Path(d) / "engine"
+            exe.write_text("#!/bin/sh\n"
+                           f"[ -e '{gone}' ] && exit 1\n"
+                           "echo 'READY 4096 stop'\n"
+                           "cat > /dev/null\n")
+            exe.chmod(0o755)
+            eng = StrataEngine(str(exe), [])
+            self.assertEqual(eng.max_context, 4096)
+            gone.touch()                                # from now on it cannot start
+            eng.proc.kill()
+            eng.proc.wait()
+            with self.assertRaises(RuntimeError):
+                eng.restart()
+            self.assertEqual(eng.max_context, 4096)
+            self.assertFalse(eng.alive())               # (so the next request's ensure_engine tries again)
+
+
 if __name__ == "__main__":
     unittest.main()

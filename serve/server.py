@@ -657,8 +657,17 @@ class StrataEngine:
             for q in self._routes.values():
                 q.put(None)
         info = dict(self.info)
+        ctx = self.max_context
         self.ended = False
-        self.__init__(*self.spawn)
+        try:
+            self.__init__(*self.spawn)
+        except Exception:
+            # (#351: a start that fails - a GPU that fell off the bus - left max_context 0, so every later request
+            #  failed its size check with "exceeds the context (0)" before ensure_engine could try again; the context
+            #  stays what it was, the next request starts it again or says why it cannot)
+            self.max_context = ctx
+            self.info = {**info, **self.info}
+            raise
         self.info = {**info, **self.info}
 
     @property
