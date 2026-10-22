@@ -450,6 +450,16 @@ against the per-job one on every GPU at load (any difference fails the start).
 | `MAYA_DS4_Q8_BATCH` | off | `1`: a GEMV call's int8 rounding in one launch (the same bits) |
 | `MAYA_DS4_Q8_CHECK` | off | `1`: the batched rounding checked against the per-job one on every GPU at load |
 
+## DeepSeek: where the measured hipBLASLt picks are kept (AMD)
+
+On AMD the engine measures hipBLASLt's kernels for each prompt GEMM shape at its first use on a GPU and keeps the
+picks in `<pack>/lt-picks.txt`, so later starts reuse them. A pack whose files must not change (one shared between
+installs, or checked by hash before each start) can keep them elsewhere.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_LT_STORE` | `<pack>/lt-picks.txt` | the picks in this file instead; empty: none kept, each start measures its own |
+
 ## DeepSeek: the starting expert profile
 
 The engine keeps how often each expert was routed in `<pack>/expert-profile.bin`: at a start the most-routed experts
