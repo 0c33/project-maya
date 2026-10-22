@@ -7586,7 +7586,7 @@ struct Model::Impl {
             } else {
                 m = pcie::split(C.cost, n, cold, D.slots);
                 LaneAB& A = C.ab[cold != 0 ? 1 : 0];
-                if (m != 0 && A.verdict < 0)
+                if (m != 0 && (A.verdict < 0 || tok_ab_off))   // (tok_ab_off: the whole-step check's turn, or its verdict)
                     m = 0;
                 else if (m != 0 && A.verdict == 0 && !ln_no_done.load()) {   // (the check: turn by turn)
                     lt.ab = cold != 0 ? 1 : 0;
@@ -7663,6 +7663,80 @@ struct Model::Impl {
         for (const LaneCls& K : ln_cls)
             if (K.dev == C.dev && K.stream && (K.ab[0].verdict >= 0 || K.ab[1].verdict >= 0)) off = false;
         if (off) lane_put(lane_dev_key(C.dev) + " | lane", "off");
+    }
+
+    // decode's check over whole decode steps (#329): lane_ab times one layer's lanes, where the split wins - and the
+    // token as a whole got slower (2x 4090, a 7900 XTX, an RTX PRO 6000: 10-30%): the streamed experts' trips through
+    // the host memory slow the rest of the step, which no layer's own timing sees.  Steps take turns in runs of 8 -
+    // streaming allowed, or none (decoded tokens: the lane serves T == 1 steps only) - and their time a token decides with lane_ab's rule over windows of 64 tokens of each:
+    // 3% faster twice in a row: streaming stays (lane_ab decides the rest); twice not, or undecided after 9 windows:
+    // none from then on, and the times file keeps it for the next start.  DS4_STREAM_TOKEN_AB=0: off (A/B tests)
+    struct TokAB {
+        double ms[2] = {0, 0};
+        int64_t n[2] = {0, 0};
+        int arm = 0, left = 0, wins = 0, good = 0, bad = 0;
+        int verdict = 0;           // 1: streaming measured faster, -1: not (none from then on), 0: measuring
+    };
+    TokAB tok_ab;
+    std::atomic<bool> tok_ab_off{false};   // this step: the split takes no experts (the check's CPU-lane-only turn;
+                                           // read by serve_lane's thread)
+    double tok_ab_t0 = 0;
+    bool tok_ab_active() const {
+        static const bool on = [] {
+            const char* v = std::getenv("DS4_STREAM_TOKEN_AB");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        if (!on || !ln_force.empty() || tok_ab.verdict > 0) return false;
+        for (const LaneCls& C : ln_cls)
+            if (C.stream) return true;
+        return false;
+    }
+    void tok_ab_begin() {
+        tok_ab_off = false;
+        if (!tok_ab_active()) return;
+        if (tok_ab.verdict < 0) {
+            tok_ab_off = true;
+            return;
+        }
+        if (tok_ab.left <= 0) {
+            tok_ab.arm ^= 1;
+            tok_ab.left = 8;
+        }
+        --tok_ab.left;
+        tok_ab_off = tok_ab.arm == 0;
+        tok_ab_t0 = now_ms();
+    }
+    void tok_ab_end(int T, bool ok) {
+        if (!ok || !tok_ab_active() || tok_ab.verdict != 0) return;
+        TokAB& A = tok_ab;
+        A.ms[A.arm] += now_ms() - tok_ab_t0;
+        A.n[A.arm] += T;
+        if (A.n[0] < 64 || A.n[1] < 64) return;
+        const double m0 = A.ms[0] / (double) A.n[0], m1 = A.ms[1] / (double) A.n[1], gain = 1.0 - m1 / m0;
+        A.ms[0] = A.ms[1] = 0;
+        A.n[0] = A.n[1] = 0;
+        if (++A.wins == 1) return;   // (the first window warms up)
+        if (gain >= 0.03) {
+            A.bad = 0;
+            if (++A.good >= 2) A.verdict = 1;
+        } else {
+            A.good = 0;
+            if (++A.bad >= 2) A.verdict = -1;
+        }
+        if (A.verdict == 0 && A.wins >= 9) A.verdict = -1;
+        if (A.verdict == 0) return;
+        std::fprintf(stderr, "ds4: PCIe lane: decode measured whole steps with the split against the CPU lane alone: "
+                             "%.2f against %.2f ms a token (%+.1f%%) -> %s\n", m1, m0, -100.0 * gain,
+                     A.verdict > 0 ? "it streams" : "it no longer streams (kept for the next start)");
+        if (A.verdict < 0) {
+            tok_ab_off = true;
+            std::vector<int> seen;
+            for (const LaneCls& C : ln_cls)
+                if (C.stream && std::find(seen.begin(), seen.end(), C.dev) == seen.end()) {
+                    seen.push_back(C.dev);
+                    lane_put(lane_dev_key(C.dev) + " | lane", "off");
+                }
+        }
     }
 
     // decode's own timing of a class's lanes (GLM's lane_retime): the start-up timing is one moment, each lane alone;
@@ -8483,7 +8557,7 @@ struct Model::Impl {
         for (int i = 0; i < n; ++i) tk[i + 1] = drafts[(size_t) i];
         spec_win = true;
         const double tv = now_ms();
-        const bool ok = forward(tk, T, T, err, 0);
+        const bool ok = forward(tk, T, T, err, 0);   // (a window streams nothing - the lane is a decoded token's)
         st.verify_ms += now_ms() - tv;
         spec_win = false;
         if (!ok) return false;
@@ -8612,7 +8686,12 @@ struct Model::Impl {
     }
 
     // ---- a window: T tokens at positions pos .. pos + T - 1 through every layer; the logits of its last `logits` rows
-    bool step(int token, bool want_logits, std::string& err) { return forward(&token, 1, want_logits ? 1 : 0, err); }
+    bool step(int token, bool want_logits, std::string& err) {
+        tok_ab_begin();
+        const bool ok = forward(&token, 1, want_logits ? 1 : 0, err);
+        tok_ab_end(1, ok);
+        return ok;
+    }
 
 
     // a chunk's sum over its group: three members or more through the copy engines (allreduce_dma, c.y its scratch:
