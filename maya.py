@@ -455,6 +455,12 @@ DS4_EXL3 = {"exl3": {"bits": "2.9", "manifest": DS4_MANIFEST, "weights_gb": 211,
                          "memory_gb": 280, "dir": DS4_35}}
 FAMILIES = ("glm", "deepseek")
 SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
+
+
+def exe_for_target(target: str) -> Path:
+    """The engine binary for a build target name ("maya" or "maya-ds4"; EXE's and DS4_EXE's own stems) - resolved
+    fresh on every call since select_build_backend() reassigns EXE/DS4_EXE once the backend (cuda/hip) is known."""
+    return {"maya": EXE, "maya-ds4": DS4_EXE}[target]
 GLM_ARCHS = ("glm5-next", "glm5next")             # llama.cpp's spelling and unsloth's
 # the expert profile setup passes to every GLM config (tools/make_profile.py --glm):
 # its ranking of every (layer, expert) pair decides each layer's VRAM slots and which experts start there
@@ -1398,7 +1404,7 @@ def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, s
             "llama": str(llama), "lib_dirs": cuda_lib_dirs(nvcc), "date": time.strftime("%Y-%m-%d %H:%M"),
             "targets": sorted({target} | (set(old.get("targets") or ["maya"]) if same else set()))}
     STAMP.write_text(json.dumps(meta, indent=1), encoding="utf-8")
-    ok(f"engine compiled: {DS4_EXE if target == 'maya-ds4' else EXE}")
+    ok(f"engine compiled: {exe_for_target(target)}")
     return meta
 
 
@@ -1584,7 +1590,7 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str 
             "lib_dirs": [str(bindir if WIN else root / "lib")], "date": time.strftime("%Y-%m-%d %H:%M"),
             "targets": sorted({target} | (set(old.get("targets") or ["maya"]) if same else set()))}
     STAMP.write_text(json.dumps(meta, indent=1), encoding="utf-8")
-    ok(f"engine compiled: {DS4_EXE if target == 'maya-ds4' else EXE}")
+    ok(f"engine compiled: {exe_for_target(target)}")
     return meta
 
 
@@ -1592,7 +1598,7 @@ def build_step(a, pc, llama: Path, target: str = "maya") -> dict:
     step(4, "the engine")
     src = S.source_hash(S.ENGINE_SOURCES)              # src/, include/, third_party/ggml, CMakeLists.txt
     meta = read_json(STAMP)
-    exe = DS4_EXE if target == "maya-ds4" else EXE
+    exe = exe_for_target(target)
     if pc.get("backend") == "hip":
         if (exe.exists() and not a.rebuild and meta.get("backend") == "hip" and meta.get("src") == src
                 and meta.get("archs") == pc["archs"] and meta.get("rocm") == pc["rocm"]
@@ -3179,6 +3185,12 @@ BENCH_TOPICS = [
 ]
 
 
+def bench_exe(cfg: dict) -> Path:
+    """Which engine binary a HIP config's --bench should relaunch - config_family(cfg)'s target, through the same
+    exe_for_target every build step uses, so this can't drift out of sync with either."""
+    return exe_for_target("maya-ds4" if config_family(cfg) == "deepseek" else "maya")
+
+
 def bench(cfg_path: Path, version: str) -> int:
     """--bench: a standard speed test of the installed model on this PC - decode (writing an answer) on three
     questions and prefill (reading a prompt) at 2k and 8k tokens of this folder's docs - through the engine alone, the
@@ -3187,7 +3199,7 @@ def bench(cfg_path: Path, version: str) -> int:
     cfg = read_json(cfg_path)
     select_build_backend(cfg.get("backend", "cuda"))
     if cfg.get("backend") == "hip":
-        cfg["exe"] = str(EXE)
+        cfg["exe"] = str(bench_exe(cfg))
     port = cfg.get("port") or 8080
     try:
         urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2)
