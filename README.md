@@ -225,6 +225,23 @@ builds everything once (20-40 minutes plus the download) and **starts the model*
   [speed calibration](docs/SETTINGS.md#the-speed-calibration) measures it on your PC and keeps it only where it is
   faster. The drafter's license is non-commercial (CC BY-NC-ND 4.0).
 
+### DeepSeek: conversations kept
+
+The DeepSeek-V4.1-Flash-1017 engine holds one conversation: a prompt that continues it reuses its state, anything else
+starts over. With this on, a conversation another request takes the model from - a chat, or an agent's parent and
+workers - is set aside, and a request that continues it reads only its new tokens: in RAM, or across a restart from
+the folder. Off by default; the config sets them under the same `MAYA_DS4_*` names
+([how](docs/SETTINGS.md#deepseek-conversations-kept-an-agents-parent-and-workers-on-one-model)):
+
+| Setting | Default | |
+| --- | --- | --- |
+| `STRATA_DS4_SLOT_KEEP` | off | `1`: conversations are set aside when another one takes the model, and kept across runs in the folder; `0`: every switch reads its prompt from token 0, as before |
+| `STRATA_DS4_SLOT_CAP` | 4 | conversations kept in RAM (tens to hundreds of MB each); past it the least recently used is written to the folder and read back from there; `0` = none |
+| `STRATA_DS4_SLOT_GB` | 16 | the folder's total size (GB, its `.bin` files): past it the folder's least recently used conversation is removed - never the one just written, so a conversation bigger than the cap stays |
+| `STRATA_DS4_SLOT_DIR` | `<pack>/slots` | the folder: a conversation is a `.bin` (its state) and a `.meta` (this model's identity, its tokens and its size) |
+| `STRATA_DS4_SLOT_MIN` | 1024 | the shortest conversation set aside (tokens): a shorter one is read again in about the time its slot would take |
+| `STRATA_DS4_SLOT_DAYS` | 7 | a slot not used for this many days is removed at start; so is any file not this model's, another engine's, or incomplete |
+
 ## Something went wrong?
 
 Run **`./maya.sh --report`** (Windows: `START-MAYA.bat --report`) right after a slow answer or an error, and attach the

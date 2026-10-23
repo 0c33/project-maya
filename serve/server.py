@@ -3735,7 +3735,8 @@ class Server(ThreadingHTTPServer):
             super().handle_error(request, client_address)
 
 
-SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_HTTP_BACKLOG", "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S") + RESPONSE_ENV_KEYS
+SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_HTTP_BACKLOG", "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S",
+              "STRATA_DS4_KEEP_THINKING") + RESPONSE_ENV_KEYS
 
 
 def apply_server_env(cfg: dict) -> None:
