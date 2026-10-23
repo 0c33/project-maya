@@ -1639,9 +1639,48 @@ bool Glm5Model::fast_setup(std::string& err) {
             const double f = (double) std::max<int64_t>(0, pin_left - (int64_t) kPinRoom) / (double) std::max<int64_t>(1, planned);
             return (int64_t) (f * (double) cls_n[c]);
         };
+        // a class pinned in pieces of at most STRATA_GLM_PIN_PIECE_MB (Windows: 1024 by default; 0: one block, as on
+        // Linux): a block of many GB takes far more of Windows' per-process pinning budget than its size - 61 GB pin in
+        // 1 GB pieces where the largest single block is ~21 GB - so a 2-GPU split's first part left its second 0 GB and
+        // the start failed (#417)
+        static const int64_t piece_mb = getenv("STRATA_GLM_PIN_PIECE_MB") ? std::atoll(getenv("STRATA_GLM_PIN_PIECE_MB"))
+#ifdef _WIN32
+                                                                          : 1024;
+#else
+                                                                          : 0;
+#endif
+        const auto pin_tier = [&](FastState::RamClass& R, int64_t n) -> void* {
+            if (R.per_part <= 0) {
+                void* q = nullptr;
+                return pin_alloc(&q, (size_t) n * R.stride, cudaHostAllocPortable) == cudaSuccess ? q : nullptr;
+            }
+            R.parts.clear();
+            for (int64_t s = 0; s < n; s += R.per_part) {
+                void* q = nullptr;
+                const size_t bytes = (size_t) std::min<int64_t>(R.per_part, n - s) * R.stride;
+                if (pin_alloc(&q, bytes, cudaHostAllocPortable) != cudaSuccess) {
+                    for (size_t i = 0; i < R.parts.size(); ++i)
+                        pin_free(R.parts[i], (size_t) std::min<int64_t>(R.per_part, n - (int64_t) i * R.per_part) * R.stride);
+                    R.parts.clear();
+                    return nullptr;
+                }
+                R.parts.push_back((uint8_t*) q);
+            }
+            return R.parts.empty() ? nullptr : R.parts[0];
+        };
+        const auto unpin_tier = [&](FastState::RamClass& R, void* p, int64_t n) {
+            if (R.per_part <= 0) {
+                pin_free(p, (size_t) n * R.stride);
+                return;
+            }
+            for (size_t i = 0; i < R.parts.size(); ++i)
+                pin_free(R.parts[i], (size_t) std::min<int64_t>(R.per_part, n - (int64_t) i * R.per_part) * R.stride);
+            R.parts.clear();
+        };
         for (size_t c = 0; c < cls_stride.size() && wsum > 0; ++c) {
             auto& R = F->rc[c];
             R.stride = cls_stride[c];
+            R.per_part = piece_mb > 0 ? (int) std::max<int64_t>(1, (piece_mb << 20) / (int64_t) R.stride) : 0;
             int64_t n = cls_n[c];
             const int64_t cap = cls_cap[c];
             const int64_t least = std::min<int64_t>(16, cap);   // the floor, or the whole cap when that is smaller
@@ -1652,9 +1691,10 @@ bool Glm5Model::fast_setup(std::string& err) {
             for (int tries = 0; n >= least; ++tries) {
                 if ((p = numa_pinned((size_t) n * R.stride)) != nullptr) {   // (over every socket: numa_pinned)
                     R.registered = true;
+                    R.per_part = 0;   // (one mapping)
                     break;
                 }
-                if (pin_alloc(&p, (size_t) n * R.stride, cudaHostAllocPortable) == cudaSuccess) {
+                if ((p = pin_tier(R, n)) != nullptr) {
                     // ... and leave room under the cap: a pageable copy needs pinned buffers of the driver's own, and
                     // with two tiers pinned right up to it the warmed tables' upload failed (#105).  512 MB more that
                     // will not pin: a step less
@@ -1664,7 +1704,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                         break;
                     }
                     cudaGetLastError();
-                    pin_free(p, (size_t) n * R.stride);
+                    unpin_tier(R, p, n);
                 }
                 cudaGetLastError();
                 p = nullptr;
@@ -1784,7 +1824,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             bool agree = true;   // arenas on different nodes: no line
             for (const auto& R : F->rc)
                 if (R.base != nullptr && R.n > 0) {
-                    const int node = win_arena_node(R.base, (size_t) R.n * R.stride);
+                    const int node = win_arena_node(R.base, R.part_slots(0) * R.stride);
                     if (node < 0) continue;
                     agree = agree && (tier_node < 0 || node == tier_node);
                     tier_node = node;
@@ -1869,7 +1909,8 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
         return false;
     }
     std::vector<std::pair<void*, size_t>> regions;
-    for (const auto& r : F->rc) regions.push_back({r.base, (size_t) r.n * r.stride});
+    for (const auto& r : F->rc)
+        for (size_t i = 0; i < r.n_parts(); ++i) regions.push_back({r.part(i), r.part_slots(i) * r.stride});
     const int device = std::atoi(getenv("STRATA_GLM_EXPERT_HELPER"));
     if (device == dev_ || !F->helper.open(device, g_.n_embd, g_.n_ff_exp, regions, err)) return false;
     std::vector<int> ranked;
@@ -1897,7 +1938,7 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
         auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
         if (R.stride > F->helper.available()) continue;
         const int rs = F->ram_of[(size_t) key];
-        const uint8_t* host = rs >= 0 ? R.base + (size_t) rs * R.stride : F->stage[0];
+        const uint8_t* host = rs >= 0 ? R.slot((size_t) rs) : F->stage[0];
         if (rs < 0) for (int role = 0; role < 3; ++role) fast_read_part(il, e, role, F->stage[0], 0, 1);
         if (!F->helper.insert(key, host, F->L[(size_t) il].blob, R.stride, err)) return false;
         if (F->helper.integrated()) R.st[(size_t) rs] = FastState::kRHelper;
@@ -1955,7 +1996,7 @@ bool Glm5Model::fast_helper_adapt(std::string& err) {
         const int il = s.in / g_.n_expert;
         auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
         const int rs = F->ram_of[(size_t) s.in];
-        const uint8_t* src = rs >= 0 ? R.base + (size_t) rs * R.stride : F->stage[0];
+        const uint8_t* src = rs >= 0 ? R.slot((size_t) rs) : F->stage[0];
         if (rs < 0) for (int role = 0; role < 3; ++role) fast_read_part(il, s.in % g_.n_expert, role, F->stage[0], 0, 1);
         if (!F->helper.replace(s.out, s.in, src, err)) return false;
         if (F->helper.integrated()) {
@@ -1968,7 +2009,7 @@ bool Glm5Model::fast_helper_adapt(std::string& err) {
                 R.tick[(size_t) dst] = F->clock;
                 F->ram_of[(size_t) s.out] = -1;
                 F->ram_of[(size_t) s.in] = dst;
-                const unsigned long long zero = 0, ptr = (unsigned long long) (R.base + (size_t) dst * R.stride);
+                const unsigned long long zero = 0, ptr = (unsigned long long) (R.slot((size_t) dst));
                 if (!glmfast::cuda_ok(cudaMemcpy(F->tab + F->rtab_key(s.out), &zero, sizeof(zero), cudaMemcpyHostToDevice),
                                      "helper old RAM entry", err) ||
                     !glmfast::cuda_ok(cudaMemcpy(F->tab + F->rtab_key(s.in), &ptr, sizeof(ptr), cudaMemcpyHostToDevice),
@@ -2874,7 +2915,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     std::vector<const uint8_t*> cal_all;
     for (int s = 0; s < R.n && (int) cal_all.size() < 4 * kCalSets; ++s)
         if (R.st[(size_t) s] == FastState::kRHold && R.key[(size_t) s] / g.n_expert == il_cal)
-            cal_all.push_back(R.base + (size_t) s * R.stride);
+            cal_all.push_back(R.slot((size_t) s));
     if (cal_all.empty()) {   // nothing in RAM: the lane would never run (a complete pool: every expert in VRAM)
         std::fprintf(stderr, "glm fast: CUDA%d CPU lane off: the RAM tier holds no expert\n", dev_);
         return true;
@@ -3529,8 +3570,8 @@ bool Glm5Model::fast_warm(std::string& err) {
             R.key[(size_t) s] = key;
             R.st[(size_t) s] = FastState::kRHold;
             F->ram_of[(size_t) key] = s;
-            th[N + (size_t) key] = (unsigned long long) (R.base + (size_t) s * R.stride);
-            jobs.push_back(Job{il, e, R.base + (size_t) s * R.stride, false});
+            th[N + (size_t) key] = (unsigned long long) (R.slot((size_t) s));
+            jobs.push_back(Job{il, e, R.slot((size_t) s), false});
             --rfree[(size_t) c];
             progress = true;
         }
@@ -3718,7 +3759,8 @@ void Glm5Model::fast_destroy() {
     F->kda_graphs.clear();   // before the graph's buffers and streams are freed
     for (auto& R : F->rc)
         if (R.base && R.registered) numa_pinned_free(R.base, (size_t) R.n * R.stride);
-        else if (R.base) cudaFreeHost(R.base);
+        else
+            for (size_t i = 0; i < R.n_parts(); ++i) cudaFreeHost(R.part(i));
     for (auto& d : F->draining) cudaEventDestroy(d.ev);
     for (auto& m : F->bg) cudaEventDestroy(m.ev);
     for (auto e : F->ev_free) cudaEventDestroy(e);
@@ -4215,7 +4257,7 @@ void Glm5Model::fast_service() {
                     const int key = il * g.n_expert + ids[mi[m]];
                     int rs = F->ram_of[(size_t) key];
                     if (rs >= 0 && (R.st[(size_t) rs] == FastState::kRLoad || R.st[(size_t) rs] == FastState::kRNew)) {
-                        dst[m] = R.base + (size_t) rs * R.stride;
+                        dst[m] = R.slot((size_t) rs);
                         if (R.st[(size_t) rs] == FastState::kRLoad) {
                             auto& ld = F->rload[(size_t) cls][(size_t) rs];
                             uint64_t v = ld.load(std::memory_order_acquire);
@@ -4252,7 +4294,7 @@ void Glm5Model::fast_service() {
                                 break;
                             }
                         if (draining) {
-                            dst[m] = R.base + (size_t) rs * R.stride;
+                            dst[m] = R.slot((size_t) rs);
                             continue;
                         }
                     }
@@ -4268,7 +4310,7 @@ void Glm5Model::fast_service() {
                         R.tick[(size_t) rs] = F->clock;
                         R.st[(size_t) rs] = ((promo >> mi[m]) & 1u) ? FastState::kRRelease : FastState::kRNew;
                         F->ram_of[(size_t) key] = ((promo >> mi[m]) & 1u) ? -1 : rs;
-                        dst[m] = R.base + (size_t) rs * R.stride;
+                        dst[m] = R.slot((size_t) rs);
                         if ((promo >> mi[m]) & 1u) R.key[(size_t) rs] = -1;   // a pure staging use: freed at the boundary
                     } else {
                         dst[m] = F->stage[(size_t) m];
@@ -4583,7 +4625,7 @@ void Glm5Model::fast_ahead_reader() {
         auto& ld = F->rload[(size_t) j.rclass][(size_t) j.rslot];
         uint64_t want = j.tag << 2;
         if (ld.compare_exchange_strong(want, (j.tag << 2) | 1u, std::memory_order_acq_rel)) {
-            uint8_t* blob = F->rc[(size_t) j.rclass].base + (size_t) j.rslot * F->rc[(size_t) j.rclass].stride;
+            uint8_t* blob = F->rc[(size_t) j.rclass].slot((size_t) j.rslot);
             for (int role = 0; role < 3; ++role) fast_read_part(j.il, j.e, role, blob);
             ld.store((j.tag << 2) | 2u, std::memory_order_release);
         }
@@ -4690,7 +4732,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 // a LOOKAHEAD read nobody asked for yet: in the RAM tier once it landed
                 if ((F->rload[c][(size_t) s].load(std::memory_order_acquire) & 3u) == 2u) {
                     R.st[(size_t) s] = FastState::kRHold;
-                    upd(F->rtab_key(R.key[(size_t) s]), (unsigned long long) (R.base + (size_t) s * R.stride));
+                    upd(F->rtab_key(R.key[(size_t) s]), (unsigned long long) (R.slot((size_t) s)));
                 }
             } else if (R.st[(size_t) s] == FastState::kRRelease) {
                 const int key = R.key[(size_t) s];
@@ -4702,7 +4744,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 R.st[(size_t) s] = FastState::kRFree;
             } else if (R.st[(size_t) s] == FastState::kRNew) {
                 R.st[(size_t) s] = FastState::kRHold;
-                upd(F->rtab_key(R.key[(size_t) s]), (unsigned long long) (R.base + (size_t) s * R.stride));
+                upd(F->rtab_key(R.key[(size_t) s]), (unsigned long long) (R.slot((size_t) s)));
             } else if (R.st[(size_t) s] == FastState::kRHold && tier_gc) {
                 // exclusive tiers, kept (STRATA_GLM_TIER_GC=0: not): a held copy the tables lost (a route promoted or re-read the expert while its
                 // demotion was still landing, which then held a second copy nothing points at) or of an expert VRAM
@@ -4713,7 +4755,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 if (key >= 0 && ro == s && F->slot_of[(size_t) key] < 0) continue;   // the normal case
                 if (key >= 0 && ro < 0 && F->slot_of[(size_t) key] < 0) {
                     F->ram_of[(size_t) key] = s;
-                    upd(F->rtab_key(key), (unsigned long long) (R.base + (size_t) s * R.stride));
+                    upd(F->rtab_key(key), (unsigned long long) (R.slot((size_t) s)));
                     ++F->diag_adopt;
                     continue;
                 }
@@ -4740,7 +4782,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
         auto& R = F->rc[(size_t) d.rclass];
         if (R.st[(size_t) d.rslot] == FastState::kRDemote && R.key[(size_t) d.rslot] == d.key) {
             R.st[(size_t) d.rslot] = FastState::kRHold;
-            upd(F->rtab_key(d.key), (unsigned long long) (R.base + (size_t) d.rslot * R.stride));
+            upd(F->rtab_key(d.key), (unsigned long long) (R.slot((size_t) d.rslot)));
             if (F->ram_resident) {   // the deferred half of the move: forget the VRAM copy only now
                 upd(F->tab_key((size_t) d.key), 0ull);
                 F->slot_of[(size_t) d.key] = -1;
@@ -4839,7 +4881,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 R.tick[(size_t) rs] = F->clock;
                 R.st[(size_t) rs] = FastState::kRDemote;
                 F->ram_of[(size_t) vkey] = rs;
-                cudaMemcpyAsync(R.base + (size_t) rs * R.stride, P.slot_ptr(v),
+                cudaMemcpyAsync(R.slot((size_t) rs), P.slot_ptr(v),
                                 F->L[(size_t) il].blob, cudaMemcpyDeviceToHost, F->copy);
                 cudaEvent_t ev = F->get_event();
                 cudaEventRecord(ev, F->copy);
@@ -4924,7 +4966,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 R.st[(size_t) m.rslot] = FastState::kRHold;
                 R.tick[(size_t) m.rslot] = F->clock;
                 F->ram_of[(size_t) m.key] = m.rslot;
-                upd(F->rtab_key((size_t) m.key), (unsigned long long) (R.base + (size_t) m.rslot * R.stride));
+                upd(F->rtab_key((size_t) m.key), (unsigned long long) (R.slot((size_t) m.rslot)));
                 ++F->bg_down;
             }
             F->ev_free.push_back(m.ev);
@@ -5023,7 +5065,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 if (c.free_slot >= 0) {
                     P.st[(size_t) c.free_slot] = FastState::kLanding;
                     R.st[(size_t) c.rs] = FastState::kRPin;
-                    cudaMemcpyAsync(P.slot_ptr(c.free_slot), R.base + (size_t) c.rs * R.stride, F->L[(size_t) c.il].blob,
+                    cudaMemcpyAsync(P.slot_ptr(c.free_slot), R.slot((size_t) c.rs), F->L[(size_t) c.il].blob,
                                     cudaMemcpyHostToDevice, F->copy);
                     cudaEvent_t ev = F->get_event();
                     cudaEventRecord(ev, F->copy);
@@ -5038,7 +5080,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                     P.st[(size_t) c.cold_slot] = FastState::kDraining;   // (still live in VRAM until the copy landed)
                     R.st[(size_t) rs] = FastState::kRDemote;
                     R.key[(size_t) rs] = vkey;
-                    cudaMemcpyAsync(R.base + (size_t) rs * R.stride, P.slot_ptr(c.cold_slot), F->L[(size_t) c.il].blob,
+                    cudaMemcpyAsync(R.slot((size_t) rs), P.slot_ptr(c.cold_slot), F->L[(size_t) c.il].blob,
                                     cudaMemcpyDeviceToHost, F->copy);
                     cudaEvent_t ev = F->get_event();
                     cudaEventRecord(ev, F->copy);

@@ -699,8 +699,16 @@ class DsmlRewriter:
         rest, self.buf = self.buf, ""
         return self._plain(rest)
 
+    @staticmethod
+    def _esc(s: str) -> str:
+        """s as JSON string content - character by character, so pieces of a value escape to the whole's escape
+        (issue #403) - with `<` as \\u003c (see _tag)."""
+        return json.dumps(s, ensure_ascii=False)[1:-1].replace("<", "\\u003c")
+
     def _plain(self, s: str) -> str:
         if self.in_param:
+            if self.parameter_string:    # a string value goes out as it is written (issue #403: a long file's
+                return self._esc(s)      # content held to its closing tag left clients without data for minutes)
             self.parameter_text += s
             return ""
         return "" if self.in_calls and not self.in_param and not s.strip() else s
@@ -710,8 +718,7 @@ class DsmlRewriter:
         if self.in_param and not (closing and kind == "parameter"):
             # Like the reference decoder, only the parameter's closing tag is
             # structural here. Other DSML tags can be literal argument data.
-            self.parameter_text += tag
-            return ""
+            return self._plain(tag)
         attrs = dict(_DSML_ATTR.findall(body))
         if kind == "calls":
             self.in_calls = not closing
@@ -721,16 +728,16 @@ class DsmlRewriter:
         if kind == "parameter":
             self.in_param = not closing
             if closing:
-                value = json.dumps(self.parameter_text, ensure_ascii=False) if self.parameter_string else self.parameter_text
                 # A JSON string can contain a literal legacy parser delimiter
                 # (e.g. a tool writing an XML example). JSON's Unicode escape
                 # keeps those values intact across this internal rewrite.
-                value = value.replace("<", "\\u003c")
+                # (a string value: its quotes around the pieces _plain sent as they came)
+                value = '"' if self.parameter_string else self.parameter_text.replace("<", "\\u003c")
                 self.parameter_text = ""
                 return value + ARG_VAL_END
             self.parameter_string = attrs.get("string") == "true"
             self.parameter_text = ""
-            return ARG_KEY + attrs.get("name", "") + ARG_KEY_END + ARG_VAL
+            return ARG_KEY + attrs.get("name", "") + ARG_KEY_END + ARG_VAL + ('"' if self.parameter_string else "")
         return tag
 
 
@@ -847,6 +854,8 @@ class OutputParser:
                 if self.sdeclared.get(pname) == "string":
                     args('"')
                     self.ss, self.sval_started = "str", True     # GLM's values are written as they are
+                elif self.dsml is not None:   # DeepSeek's: a string="true" value arrives JSON-quoted, piece by piece
+                    self.ss, self.sval_started = "jstr", False
                 else:
                     self.ss = "raw"
             elif self.ss == "between":
@@ -895,6 +904,25 @@ class OutputParser:
                     args(json.dumps(rest[:safe])[1:-1])
                     self.sp += safe
                 return out
+            elif self.ss == "jstr":
+                # DsmlRewriter's value: JSON string content between quotes as it is written (its closing quote comes
+                # with the end tag), or a string="false" value whole.  A value that is not complete yet is a string's:
+                # its pieces go out as they are (issue #403); one that arrives complete takes the raw path.
+                end = rest.find(self.vend)
+                if end >= 0 and self.sval_started:
+                    args(rest[:end])                 # (its last piece and the closing quote)
+                    self.sp += end + len(self.vend)
+                    self.ss = "between"
+                    continue
+                if end >= 0:
+                    self.ss = "raw"
+                    continue
+                if not rest or (not self.sval_started and rest[0] != '"'):
+                    return out                       # (a string="false" value: complete at its end tag)
+                args(rest)
+                self.sp += len(rest)
+                self.sval_started = True
+                return out
             elif self.ss == "raw":
                 end = rest.find(self.vend)
                 if end < 0:
@@ -921,9 +949,9 @@ class OutputParser:
         if self.scall is None or self.ss == "done":
             return out
         tail = ""
-        if self.ss == "str":
+        if self.ss == "str" or (self.ss == "jstr" and self.sval_started):
             tail += '"'
-        elif self.ss == "raw":
+        elif self.ss in ("raw", "jstr"):
             tail += json.dumps(self.buf[self.sp:].strip("\n"))
         tail += "}"
         out.append(Event("tool_args", tail, call=self.scall))

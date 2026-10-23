@@ -3010,7 +3010,11 @@ def after_server(rc: int, a) -> int:
 # the engine log's lines that tell where the time goes: how the model was split across VRAM / RAM / the SSD, the
 # prompt path's chunks, and the per-token breakdown ("glm stat": VRAM hits, RAM fetches, disk reads, CPU lane)
 REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm stat|glm slots|glm prefill: \d|ERR|error|failed|"
-                          r"out of memory", re.I)
+                          r"out of memory|"
+                          # maya-ds4's placement and speed lines (issue #416), not its loading progress
+                          r"^ds4: (?!copying experts |experts \d+ / |loading \d)|^ds4 (?:slots|cache):|^maya-ds4:|"
+                          r"^(?:prompt|decode): \d+ tokens in |^decode per token:|^decode (?:reads|left out)|^dspark",
+                          re.I)
 STAT_DECODE = re.compile(r"glm stat: decode ([\d.]+) ms/tok")
 
 
@@ -3019,7 +3023,7 @@ def speed_lines(text) -> list:
     its "glm stat" line keeps only the prompt part, not a meaningless decode speed (96,000 tokens/s, issue #8)."""
     picked = []
     for x in text:
-        if not REPORT_LINES.search(x) or "warming the expert tiers" in x:
+        if not REPORT_LINES.search(x.strip()) or "warming the expert tiers" in x:
             continue
         m = STAT_DECODE.search(x)   # no decode: under 1 ms a token, or no expert touched (one prompt token out)
         if m and (float(m.group(1)) < 1.0 or "vram hit 0.00%" in x) and "| prompt " in x:
@@ -3144,16 +3148,20 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
     for c in have:
         cfg = read_json(c)
         args = cfg.get("args") or []
-        pack = Path(args[args.index("--glm-pack") + 1]) if "--glm-pack" in args[:-1] else None
+        pack = next((Path(args[args.index(k) + 1]) for k in ("--glm-pack", "--pack") if k in args[:-1]), None)
         ctx = args[args.index("--max-context") + 1] if "--max-context" in args[:-1] else "?"
         d = pack.parent if pack else None
+        if config_family(cfg) == "deepseek":   # (maya-ds4 runs its vision tower itself: on unless --vision off, #416)
+            images = "off" if "--vision" in args[:-1] and args[args.index("--vision") + 1] == "off" else "on"
+        else:
+            images = "on" if cfg.get("vision") else "off"
         where = ""
         if d is not None and d.exists():
             gb = sum(p.stat().st_size for p in d.glob("*.gguf")) / 1e9
             where = (f"\nmodel folder {d}: {gb:.1f} GB of GGUF, {shutil.disk_usage(d).free / 1e9:.0f} GB free, "
                      f"{'a spinning hard disk' if rotational(d) else 'not a hard disk'}")
         add(f"Setup {c.name}", f"model {(cfg.get('installer') or {}).get('quant', '?')}, context {ctx}, "
-                               f"GPUs {cfg.get('gpu')}, images {'on' if cfg.get('vision') else 'off'}, "
+                               f"GPUs {cfg.get('gpu')}, images {images}, "
                                f"settings {json.dumps(cfg.get('env') or {})}" + where)
         log = Path(cfg.get("log") or c.with_suffix(".log"))
         if log.exists():
@@ -3247,7 +3255,11 @@ def bench(cfg_path: Path, version: str) -> int:
             if line.startswith("READY"):
                 break
         ok(f"loaded in {time.time() - t0:.0f} s")
-        chat = lambda q: tok.encode("[gMASK]<sop><|user|>\n" + q + "<|assistant|>\n</think>", parse_special=True)
+        if config_family(cfg) == "deepseek":   # (its own chat format, thinking off - issue #416: not GLM's markers)
+            chat = lambda q: tok.encode("<｜begin▁of▁sentence｜><｜User｜>" + q + "<｜Assistant｜></think>",
+                                        parse_special=True)
+        else:
+            chat = lambda q: tok.encode("[gMASK]<sop><|user|>\n" + q + "<|assistant|>\n</think>", parse_special=True)
         gen(chat("Say hello in five languages."), 64)          # warm-up: the first answer after a start is slower
         results = []
         for q in BENCH_TOPICS:
@@ -3824,7 +3836,10 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
         args += ["--threads", "on"]
     kept = keep_args(old.get("args") or [], args, ("--tp", "--prefill-chunk", "--reserve-mib", "--vram-experts",
                                                     "--cpu-threads", "--threads", "--dspark", "--dspark-conf",
-                                                    "--expert-profile"))
+                                                    "--expert-profile", "--mmap-experts"))
+    if getattr(a, "mmap_experts", None):   # given now: written, and a later setup keeps it (issue #422)
+        set_arg(args, "--mmap-experts", a.mmap_experts)
+        ok(f"the CPU lane's experts: --mmap-experts {a.mmap_experts}")
     if vision is None:                   # (a GGUF has none of its own: vision_pack.py's, when the pack has it)
         vision = quant in DS4_EXL3 or ds4_pack_has_vision(pack)
     try:   # (the EXL3 quant's vision tower: not before RTX 30 / A100 - a V100 runs the model, text only)
@@ -4009,6 +4024,9 @@ def main() -> int:
     ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
                     help="VRAM in MiB the expert pool leaves free on each GPU for the driver, the desktop and other "
                          "programs (default 700), kept in the config")
+    ap.add_argument("--mmap-experts", choices=["auto", "on", "off"],
+                    help="DeepSeek: the experts VRAM does not hold - read in place from the files (auto, the default), "
+                         "or off: copied into RAM (with DS4_REQUIRE_ALL_RAM=1 all of them); kept in the config")
     ap.add_argument("--port", type=int, help="the dashboard's and the API's port (default 8080)")
     ap.add_argument("--host", help="where the server listens: 127.0.0.1 = this machine only (default), 0.0.0.0 = also "
                                    "other devices on your network (set --api-key too)")
@@ -4088,6 +4106,14 @@ def main() -> int:
             for i, c in enumerate(have, 1):
                 say(f"  {i}) {c.name}")
             pick = have[int(ask("Which one?", [str(i) for i in range(1, len(have) + 1)], "1", a.yes)) - 1]
+        if a.mmap_experts:   # (#422: given on a start too - written into a DeepSeek config, which keeps it)
+            cfg = read_json(pick)
+            if config_family(cfg) != "deepseek":
+                warn("--mmap-experts is a DeepSeek setting: this GLM-5.3-Flash config does not use it")
+            else:
+                set_arg(cfg.setdefault("args", []), "--mmap-experts", a.mmap_experts)
+                pick.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+                ok(f"{pick.name}: --mmap-experts {a.mmap_experts}")
         # (DeepSeek too: --speed-calibration measures its DSpark drafter against none - speed_calibration_ds4 - and keeps
         #  the faster; it used to stop here with "nothing to tune", so a config the setup wrote with --dspark none until
         #  that measurement could never get it - #393.  --calibrate tunes its --tp and CPU threads)

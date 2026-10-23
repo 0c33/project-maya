@@ -15,6 +15,7 @@
 
 #include "ds4_gguf.cuh"
 #include "ds4_gguf_cpu.hpp"
+#include "ds4_iq.cuh"
 #include "ds4_kernels.cuh"
 #include "ds4_lt.hpp"
 #include "ds4_os.hpp"
@@ -619,6 +620,12 @@ struct Chunk {
     size_t stage_stride = 0;
     std::unique_ptr<Pool> readers;
     cublasHandle_t blas = nullptr;
+    // the busy experts' path (run_set, DS4_FAT_ROWS): one expert's weights as FP16 (gate and up, then down), the rows
+    // gathered for its GEMM, the GEMM's gate | up output - fat_r rows a piece; allocated at the first use
+    uint16_t *fat_w = nullptr, *fat_x = nullptr;
+    float* fat_gu = nullptr;
+    int fat_r = 0;
+    bool fat_off = false;
     // host-mapped: a chunk's hand-off to the next group (h | pre | topk | cand), two in flight (slot = chunk % 2), each
     // with its flag, and the next group's members' acknowledgements [slot][member] (32 apart)
     uint8_t* hand[2] = {nullptr, nullptr};
@@ -3329,15 +3336,17 @@ struct Model::Impl {
         c.HQ = HQ, c.OG = OG, c.FF = FF;
         // The attention slab (its q in millions of values: the rows of q, the sparse attention and the output
         // projections at a time) and the dense weights' FP16 scratch (MB): 8 / 16, or on a device with much memory
-        // (mem: its free memory) the largest pair 2^k / 2^(k+1) up to 64 / 128 within 0.6% of it - fewer, wider GEMMs
+        // (mem: its free memory) the largest pair 2^k / 2^(k+1) up to 64 / 128 within 3% of it - fewer, wider GEMMs
         // and fewer FP16 reconstructions of the same weights a prompt (a Strix Halo with ~170 GB for its GPU: 64 / 128,
-        // a 4K prompt +6%; 8 / 16 left the GEMMs too few tiles for its 40 CUs). 32 GB and less: 8 / 16, as before.
+        // a 4K prompt +6%; 8 / 16 left the GEMMs too few tiles for its 40 CUs).  The 0.6% before left a 32 GB card at
+        // 8 / 16: slabs of 256 rows, every attention weight decoded to FP16 32 times an 8K chunk (3x V100, Maya-XS: an
+        // 8K prompt +16%, 32K +17% at 32 / 64, decode the same within noise).  24-32 GB now 32 / 64, 16 GB 16 / 32.
         // DS4_ATTN_SLAB_MB / DS4_W16_MB set them by hand.
         const size_t row_b = (size_t) HQ * 10 + (size_t) OG * g.o_lora * 6;   // (q, o F32; o FP16; oa F32 + FP16)
         size_t auto_mb = 8;
         for (size_t s = 64; s > 8 && mem > 0; s /= 2) {
             const size_t rows = std::max<size_t>(64, (s << 20) / (size_t) HQ / 64 * 64);
-            if ((double) (rows * row_b + ((2 * s) << 20)) <= 0.006 * (double) mem) {
+            if ((double) (rows * row_b + ((2 * s) << 20)) <= 0.03 * (double) mem) {
                 auto_mb = s;
                 break;
             }
@@ -3447,6 +3456,77 @@ struct Model::Impl {
                 err = "cublasGemmEx: status " + std::to_string((int) st);
                 return false;
             }
+        }
+        return true;
+    }
+    // ---- the busy experts (run_set): an expert of many rows as FP16 GEMMs.  The tiles decode its weights again for
+    // every 64 of its rows (a prompt's chunk gives a popular expert hundreds); decoded once, to the FP16 values the tiles
+    // multiply (iq::f16_rows), the library's GEMM takes them at its own speed.  DS4_FAT_ROWS=N (default 64; 0: off)
+    // takes the experts of N rows or more; the same products, only the sums' order differs
+    // (3x V100, Maya-XS: 64 rows +6-8% on 8K / 32K prompts; KL vs the reference 0.276, the stock path 0.285 - the same)
+    static int fat_rows() {
+        static const int n = std::getenv("DS4_FAT_ROWS") ? std::max(0, std::atoi(std::getenv("DS4_FAT_ROWS"))) : 64;
+        return n;
+    }
+    bool fat_ready(Dev& d, Chunk& c, int D, int FF) {
+#if defined(STRATA_USE_HIP)
+        (void) d, (void) c, (void) D, (void) FF;
+        return false;
+#else
+        if (fat_rows() <= 0 || c.fat_off) return false;
+        if (c.fat_w != nullptr) return true;
+        static const int R = std::getenv("DS4_FAT_PIECE") ? std::max(64, std::atoi(std::getenv("DS4_FAT_PIECE"))) : 1024;
+        if (cudaSetDevice(d.id) != cudaSuccess || cudaMalloc(&c.fat_w, (size_t) 2 * FF * D * 2) != cudaSuccess ||
+            cudaMalloc(&c.fat_x, (size_t) R * D * 2) != cudaSuccess ||
+            cudaMalloc(&c.fat_gu, (size_t) R * 2 * FF * 4) != cudaSuccess) {
+            cudaGetLastError();
+            std::fprintf(stderr, "ds4: CUDA%d: no VRAM for the busy experts' path (%.0f MB): the tiles take them\n", d.id,
+                         ((double) 2 * FF * D * 2 + (double) R * D * 2 + (double) R * 2 * FF * 4) / 1e6);
+            c.fat_off = true;
+            return false;
+        }
+        c.fat_r = R;
+        std::fprintf(stderr, "ds4: CUDA%d busy experts (%d rows or more) as FP16 GEMMs, %d rows a piece (%.0f MB)\n", d.id,
+                     fat_rows(), R, ((double) 2 * FF * D * 2 + (double) R * D * 2 + (double) R * 2 * FF * 4) / 1e6);
+        return true;
+#endif
+    }
+    // h16[lr0 + r] = FP16 clamped SwiGLU of the expert's gate and up over x16[row_tok[row + r]], r < n
+    bool fat_gate_up(Chunk& c, const x3::SetArgs& sa, const uint8_t* blob, int row, int n, int a, int D, int FF,
+                     cudaStream_t s, std::string& err) {
+        const int tg = gg::expert_type(sa.lay, 0);
+        if (!gg::iq::f16_rows(tg, blob + sa.lay.trellis[0], D, FF, c.fat_w, D, s) ||
+            !gg::iq::f16_rows(tg, blob + sa.lay.trellis[1], D, FF, c.fat_w + (size_t) FF * D, D, s)) {
+            err = "the busy experts' path: gate / up not decoded";
+            return false;
+        }
+        const float one = 1.0f, zero = 0.0f;
+        for (int p0 = 0; p0 < n; p0 += c.fat_r) {
+            const int np = std::min(c.fat_r, n - p0);
+            gg::iq::gather_f16(c.x16, D, c.row_tok + row + p0, np, D, c.fat_x, s);
+            if (cublasGemmEx(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, 2 * FF, np, D, &one, c.fat_w, CUDA_R_16F, D, c.fat_x,
+                             CUDA_R_16F, D, &zero, c.fat_gu, CUDA_R_32F, 2 * FF, CUBLAS_COMPUTE_32F,
+                             CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS) {
+                err = "the busy experts' path: cublasGemmEx (gate / up) failed";
+                return false;
+            }
+            gg::iq::swiglu_f16(c.fat_gu, 2 * FF, np, FF, sa.limit, c.h16 + (size_t) (row - a + p0) * FF, FF, s);
+        }
+        return true;
+    }
+    // y[lr0 + r] = down(h16[lr0 + r]), r < n
+    bool fat_down(Chunk& c, const x3::SetArgs& sa, const uint8_t* blob, int lr0, int n, int D, int FF, cudaStream_t s,
+                  std::string& err) {
+        if (!gg::iq::f16_rows(gg::expert_type(sa.lay, 2), blob + sa.lay.trellis[2], FF, D, c.fat_w, FF, s)) {
+            err = "the busy experts' path: down not decoded";
+            return false;
+        }
+        const float one = 1.0f, zero = 0.0f;
+        if (cublasGemmEx(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, D, n, FF, &one, c.fat_w, CUDA_R_16F, FF,
+                         c.h16 + (size_t) lr0 * FF, CUDA_R_16F, FF, &zero, c.y + (size_t) lr0 * D, CUDA_R_32F, D,
+                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS) {
+            err = "the busy experts' path: cublasGemmEx (down) failed";
+            return false;
         }
         return true;
     }
@@ -4117,9 +4197,33 @@ struct Model::Impl {
                 sa.n_embd = D;
                 sa.n_ff = FF;
                 sa.limit = g.lim;
+                // the busy experts (DS4_FAT_ROWS=N: those of N rows or more): their weights decoded to FP16 once and
+                // multiplied by the library's GEMM - the tiles decode an expert's weights again for every 64 of its rows
+                std::vector<int> fat;
+                if (sa.lay.fmt == gg::kFmtMXFP4 && !gg::mx_experts(sa.lay) && sa.mix.n == 0 && fat_ready(d, c, D, FF)) {
+                    int rest = 0;
+                    for (int i = i0; i < j; ++i) {
+                        const int r = b[i + 1] - b[i];
+                        if (r >= fat_rows()) fat.push_back(i);
+                        else rest = std::max(rest, r);
+                    }
+                    if (!fat.empty()) {
+                        sa.skip_ge = fat_rows();
+                        sa.max_rows = rest;
+                    }
+                }
                 if (sa.lay.fmt == gg::kFmtMXFP4) {
-                    gg::set_gate_up(sa, c.x, D, c.row_tok + a, c.h16, FF, d.st, c.x16);   // (c.x16: rows_f16 of c.x)
-                    gg::set_down(sa, c.h16, FF, c.y, D, d.st);
+                    if (sa.max_rows > 0)
+                        gg::set_gate_up(sa, c.x, D, c.row_tok + a, c.h16, FF, d.st, c.x16);   // (c.x16: rows_f16 of c.x)
+                    for (const int i : fat)
+                        if (!fat_gate_up(c, sa, sa.wbase + (size_t) (i - i0) * stride, b[i], b[i + 1] - b[i], a, D, FF,
+                                         d.st, err))
+                            return false;
+                    if (sa.max_rows > 0) gg::set_down(sa, c.h16, FF, c.y, D, d.st);
+                    for (const int i : fat)
+                        if (!fat_down(c, sa, sa.wbase + (size_t) (i - i0) * stride, b[i] - a, b[i + 1] - b[i], D, FF,
+                                      d.st, err))
+                            return false;
                 } else {
                     x3::set_gate_up(sa, c.x, D, c.row_tok + a, c.h16, FF, d.st);
                     x3::set_down(sa, c.h16, FF, c.y, D, d.st);
@@ -5431,15 +5535,26 @@ struct Model::Impl {
         // kernels (and waits on the device) and whatever else the PC runs.  With every other core a worker spinning
         // between a token's layers - 19 on a 20-core Core Ultra 7 265K, Windows 11 - that thread waited for a core:
         // decode 28.3 tok/s, the device waiting 21.4 ms a token for the lane; 18 workers 47.2, 17 workers 55.5.
-        // MAYA_DS4_LANE_FREE: the cores left free (2 by default, 0: as before)
-        static const int lane_free = [] {
-            const char* v = std::getenv("MAYA_DS4_LANE_FREE");
+        // MAYA_DS4_LANE_FREE (a config's env reaches the engine as STRATA_DS4_LANE_FREE; DS4_LANE_FREE for tests): the
+        // cores left free (2 by default, 0: as before).  Only where the lane would take every logical CPU: with SMT the
+        // lane runs a thread a core and the siblings are free already - there leaving cores out cost decode (#394: a
+        // 16-core Threadripper, 16 threads 50.6 tok/s against 14 threads 45.9)
+        static const int spare_cores = [] {
+            const char* v = std::getenv("STRATA_DS4_LANE_FREE");
+            if (v == nullptr) v = std::getenv("MAYA_DS4_LANE_FREE");
+            if (v == nullptr) v = std::getenv("DS4_LANE_FREE");
             return v != nullptr ? std::max(0, std::atoi(v)) : 2;
         }();
+        size_t logical = 0, used = 0;
+        for (const auto& p : core_threads)
+            for (const os::Core& co : p) logical += co.cpus.size();
+        for (const auto& v : c.cpus) used += v.size();
+        const bool leaves_none = logical == 0 || logical - std::min(logical, used) < (size_t) spare_cores + 1;
         for (size_t X = 0; X < c.cpus.size(); ++X) {
             std::vector<int> v = c.cpus[X];
             if (X == 0) v.erase(std::remove(v.begin(), v.end(), svc), v.end());   // (the service thread's)
-            if (X == 0 && o.cpu_threads <= 0 && (int) v.size() > lane_free + 1) v.resize(v.size() - (size_t) lane_free);
+            if (X == 0 && o.cpu_threads <= 0 && leaves_none && (int) v.size() > spare_cores + 1)
+                v.resize(v.size() - (size_t) spare_cores);
             int nw = (int) v.size();
             if (o.cpu_threads > 0) nw = std::max(X == 0 ? 0 : 1, std::min(nw, o.cpu_threads / NH - (X == 0 ? 1 : 0)));
             out.push_back(std::make_unique<Pool>(nw, v, 20000));   // spin through a token's layers (20 ms)
