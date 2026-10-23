@@ -119,6 +119,14 @@ CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > co
 # tokens come in bursts of 1-4 a step, and over 2 s the rate swung +-25% around the engine's steady one
 RATE_WINDOW_S = 5.0
 RATE_MIN_SPAN_S = 0.25      # younger than this there is no rate yet: the mean so far, with the span floored here
+# A request that waited this long in the FIFO gets a line in the server window when its turn comes: with nothing else
+# logged, a queue that had stopped moving (and requests piling up behind it) was indistinguishable from a busy server.
+QUEUE_LOG_S = 5.0
+# The queue watchdog (Service.start_queue_watch): how often it looks, the age at which the first waiter means the
+# queue has stopped moving, and how often it says so again while it stays that way.
+QUEUE_TICK_S = 15.0
+QUEUE_WEDGED_S = 120.0
+QUEUE_WARN_S = 60.0
 
 
 # ------------------------------------------------------------------------------------------------ engines
@@ -171,7 +179,14 @@ class FairLock:
 
     def set_capacity(self, n: int):
         with self._cv:
-            self.capacity = max(1, int(n))
+            n = max(1, int(n))
+            if n != self.capacity:
+                print(f"[maya] the engine's places: {self.capacity} -> {n} ({self._used} in use)", flush=True)
+            self.capacity = n
+            # A place held for "all of them" was sized by the old capacity: a smaller engine cannot hold more than it
+            # has, or the FIFO would stay jammed (waiting for a place that is never free) - the releases that follow
+            # give their places back and are clamped in release().
+            self._used = min(self._used, self.capacity)
             self._cv.notify_all()
 
     def _units(self, units):
@@ -194,26 +209,30 @@ class FairLock:
     def enqueue(self, units: int | None = None) -> object:
         """A place in line (wait_turn waits for it, leave gives it up): a waiter that wakes up now and then (to send
         a heartbeat) keeps its place."""
-        me = [object(), self._units(units)]
+        me = [object(), self._units(units), time.monotonic()]    # (token, units, asked at: the queue watchdog's age)
         with self._cv:
             self._queue.append(me)
         return me
 
     def wait_turn(self, me, timeout: float = -1) -> bool:
         """Wait until `me` is first in line and its places are free, then hold them (True); False after `timeout`,
-        still in line."""
+        still in line - and False at once when `me` was given up (leave) or is no longer in the line: a wedged FIFO
+        (waiting for a place that never comes free) is what a queue that stops moving was."""
         with self._cv:
             end = None if timeout is None or timeout < 0 else time.monotonic() + timeout
-            while self._queue[0] is not me or self._used + min(me[1], self.capacity) > self.capacity:
+            while True:
+                if me not in self._queue:
+                    return False
+                if self._queue[0] is me and self._used + min(me[1], self.capacity) <= self.capacity:
+                    self._queue.remove(me)
+                    me[1] = min(me[1], self.capacity)
+                    self._used += me[1]
+                    self._cv.notify_all()                   # the next in line may fit in what is left
+                    return True
                 left = None if end is None else end - time.monotonic()
                 if left is not None and left <= 0:
                     return False
                 self._cv.wait(left)
-            self._queue.popleft()
-            me[1] = min(me[1], self.capacity)
-            self._used += me[1]
-            self._cv.notify_all()                       # the next in line may fit in what is left
-            return True
 
     def leave(self, me):
         with self._cv:
@@ -225,7 +244,12 @@ class FairLock:
         k = self._units(units)
         with self._cv:
             if self._used < k:
-                raise RuntimeError("release of an unheld FairLock")
+                # A capacity that shrank under a "all places" holder (the engine restarted with fewer conversations)
+                # gives back what it has: raising here would leave the place held for ever - and the next release
+                # would too, with every request behind it waiting for a place that never comes.
+                print(f"[maya] a place was given back that is not held ({k} of {self._used} in use, capacity "
+                      f"{self.capacity}): the engine's conversations changed while it ran", flush=True)
+                k = self._used
             self._used -= k
             self._cv.notify_all()
 
@@ -234,6 +258,19 @@ class FairLock:
 
     def waiting(self) -> int:
         return len(self._queue)
+
+    def oldest_wait(self) -> float:
+        """Seconds the request first in line has been waiting (0 when nobody waits): 0 while it is being served."""
+        with self._cv:
+            if not self._queue:
+                return 0.0
+            asked = self._queue[0][2] if len(self._queue[0]) > 2 else None
+            return time.monotonic() - asked if isinstance(asked, float) else 0.0
+
+    def held_by(self) -> str:
+        """What has the engine (for a line when the queue stops moving): the places in use of its capacity."""
+        with self._cv:
+            return f"{self._used} of {self.capacity} place(s) in use"
 
     def __enter__(self):
         self.acquire()
@@ -362,6 +399,32 @@ def _stall_seconds() -> float:
 
 
 ENGINE_STALL_S = _stall_seconds()
+# A request whose OWN lines stop (T / PP / DONE / ERR for its rid) is not slow, it is lost: the engine is working on
+# other requests, so the engine-wide stall check above never fires, and this one waited for a line that no longer came
+# while it held its place in the FIFO - four of those under --parallel and every request behind them waited for ever
+# (nothing was logged, nothing expired).  After REQUEST_QUIET_S with no line of its own the request ends with an error
+# (its place is given back) and the timeout is logged.  A prompt read reports PP lines as it goes, so quiet means lost,
+# not busy; the waiting requests an engine admits later print "waits for a context" ... and 900 s is far past any read.
+def _quiet_seconds() -> float:
+    try:
+        return max(0.0, float(os.environ.get("STRATA_REQUEST_QUIET_S", "900")))
+    except ValueError:
+        return 900.0
+
+
+REQUEST_QUIET_S = _quiet_seconds()
+
+
+# The longest a stopped request's own lines (T / PP / DONE) are waited for when it is drained after a cancel: a STOP
+# an engine does not honour (or a rid it has already let go) would otherwise hold the FIFO place for ever.
+def _drain_seconds() -> float:
+    try:
+        return max(1.0, float(os.environ.get("STRATA_DRAIN_S", "60")))
+    except ValueError:
+        return 60.0
+
+
+DRAIN_S = _drain_seconds()
 STALL_CPU_SHARE = 0.02      # the engine may use 2% of one core over the window and still count as stuck: its idle
                             # threads' polls (the GLM service threads sleep 2 ms at a time when quiet); work is cores
 STALL_IO_EPS_B = 1 << 20    # bytes it may read or write in that window
@@ -657,6 +720,13 @@ class StrataEngine:
             for q in self._routes.values():
                 q.put(None)
         info = dict(self.info)
+        # The rid counter and the routes go on across the start: __init__ makes a new counter (from 1) and a new
+        # table, and a request that comes in while the old ones are still unwinding would then be given the number of
+        # one of them - its lines went to THAT request's queue, the request whose number it took popped its entry, and
+        # it waited for its own lines for ever, holding its place in the FIFO (four of those under --parallel and no
+        # request starts any more, the queue filling with requests nothing ever takes: the engine restart was the
+        # trigger, the silent wait the bug).
+        rids, routes, routes_lock = self._rids, self._routes, self._routes_lock
         ctx = self.max_context
         self.ended = False
         try:
@@ -667,7 +737,9 @@ class StrataEngine:
             #  stays what it was, the next request starts it again or says why it cannot)
             self.max_context = ctx
             self.info = {**info, **self.info}
+            self._rids, self._routes, self._routes_lock = rids, routes, routes_lock
             raise
+        self._rids, self._routes, self._routes_lock = rids, routes, routes_lock
         self.info = {**info, **self.info}
 
     @property
@@ -890,8 +962,16 @@ class StrataEngine:
                         self.proc.stdin.flush()
                     except OSError:
                         pass
+                # Bounded like the multi one (see DRAIN_S): a STOP the engine does not honour must not hold the
+                # request's place in the FIFO for ever.
+                end = time.monotonic() + DRAIN_S
                 while True:
-                    line = self.lines.get()
+                    try:
+                        line = self.lines.get(timeout=max(0.05, end - time.monotonic()))
+                    except queue.Empty:
+                        print(f"[maya] stopped, and the engine did not say the request had ended within {DRAIN_S:.0f} s "
+                              "(STRATA_DRAIN_S) - going on; the engine may still be writing it", flush=True)
+                        break
                     if line is None or line.startswith("ERR"):
                         break
                     if line.startswith("DONE"):
@@ -947,9 +1027,12 @@ class StrataEngine:
             except OSError:
                 raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
             heard, stall = time.monotonic(), {}
+            # how long a wait before the checks (the engine-wide stall watchdog, this request's own quiet): 10 s, or
+            # less when STRATA_REQUEST_QUIET_S is set low (so a test - or a tuned server - sees it in its own time)
+            poll_s = 10.0 if REQUEST_QUIET_S <= 0 else min(10.0, max(0.2, REQUEST_QUIET_S / 2))
             while True:
                 try:
-                    line = q.get(timeout=10)
+                    line = q.get(timeout=poll_s)
                 except queue.Empty:
                     if cancel.is_set():
                         return
@@ -959,6 +1042,21 @@ class StrataEngine:
                             done = True
                             self._end(why)
                             raise EngineDied(why)
+                    quiet = time.monotonic() - heard
+                    if REQUEST_QUIET_S > 0 and quiet >= REQUEST_QUIET_S:
+                        # The engine is alive (the other requests' lines reach them), so silence for this rid is this
+                        # request's loss: end it here rather than hold the FIFO place for a line that is not coming.
+                        print(f"[maya] request {rid}: the engine has said nothing of it for {quiet:.0f} s - stopping it "
+                              f"and giving its place in the queue back (STRATA_REQUEST_QUIET_S={REQUEST_QUIET_S:.0f})",
+                              flush=True)
+                        try:
+                            self.proc.stdin.write(f"STOP {rid}\n")
+                            self.proc.stdin.flush()
+                        except OSError:
+                            pass
+                        done = True                        # nothing of its own to drain: later lines are dropped
+                        raise ValueError(f"the engine never answered this request ({quiet:.0f} s without a line of "
+                                         "its own); it was stopped")
                     yield None
                     continue
                 if line is None:
@@ -994,15 +1092,26 @@ class StrataEngine:
                     self.proc.stdin.flush()
                 except OSError:
                     pass
+                # The drain is bounded: an engine that does not honour the STOP (or whose DONE for this rid was
+                # already dropped) left this loop waiting for a line that never came, holding the request's place in
+                # the FIFO for ever.  Past DRAIN_S: say so, drop the route, and let the next request run.
+                end = time.monotonic() + DRAIN_S
                 while True:
-                    line = q.get()
+                    try:
+                        line = q.get(timeout=max(0.05, end - time.monotonic()))
+                    except queue.Empty:
+                        print(f"[maya] request {rid}: stopped, and the engine did not say it had ended within "
+                              f"{DRAIN_S:.0f} s (STRATA_DRAIN_S) - going on; the engine may still be writing it",
+                              flush=True)
+                        break
                     if line is None or line.startswith("ERR "):
                         break
                     if line.startswith("DONE "):
                         self._parse_done("DONE " + line.split(None, 2)[2])
                         break
             with self._routes_lock:
-                self._routes.pop(rid, None)
+                if self._routes.get(rid) is q:                # (a restarted engine's table may hold another one)
+                    del self._routes[rid]
             self._tls.rid = None
 
     def pause(self, keep: bool = False):
@@ -1525,6 +1634,11 @@ class Service:
                       "(a minute or two) ...", flush=True)
             self.engine.restart()
             self.unloaded = False
+            # the FIFO's places are the conversations the restarted engine reports: a start that came back with other
+            # numbers (a different --parallel, no multi= at all) queued or over-admitted every request from here on
+            places = max(1, int(getattr(self.engine, "multi", 0) or 1))
+            if places != self.fifo.capacity:
+                self.fifo.set_capacity(places)
             print("[maya] the engine is running again", flush=True)
 
     def unload(self, idle_for: float | None = None) -> str:
@@ -1627,6 +1741,9 @@ class Service:
                     self._restart_with(old)
                 except Exception as e2:  # noqa: BLE001
                     err += f"; starting again with {old} failed too ({e2}) - the next request tries once more"
+            places = max(1, int(getattr(self.engine, "multi", 0) or 1))   # the reloaded engine's conversations
+            if places != self.fifo.capacity:
+                self.fifo.set_capacity(places)
             if err is None:
                 self._save_context(n)
                 print(f"[maya] the model runs with a {n}-token context now", flush=True)
@@ -1774,6 +1891,40 @@ class Service:
                                        amd=getattr(self, "backend", None) == "hip")
             if isinstance(self.engine, StrataEngine):
                 self.engine.gpu_busy = self._gpu_busy     # the stall watchdog's third sign of work
+        self.start_queue_watch()
+
+    def start_queue_watch(self):
+        """A queue that has stopped moving says so, every QUEUE_WARN_S, with what holds the engine and what is waiting:
+        a FIFO place that is never given back (a request waiting on an engine line that never came, a place leaked by
+        an error) makes every later request wait for ever, and until this line appeared nothing said anything - the
+        server looked idle, the requests piled up, and none of them expired."""
+        if getattr(self, "_queue_watch", None) is not None:
+            return
+
+        def loop():
+            warned = 0.0
+            while True:
+                time.sleep(QUEUE_TICK_S)
+                try:
+                    oldest, waiting = self.fifo.oldest_wait(), self.fifo.waiting()
+                except Exception:  # noqa: BLE001 - a diagnostic must never end the thread
+                    continue
+                if not waiting or oldest < QUEUE_WEDGED_S or time.monotonic() - warned < QUEUE_WARN_S:
+                    continue
+                warned = time.monotonic()
+                with self.status_lock:
+                    s = dict(self.status)
+                    active = self.active
+                doing = (f"a request is running ({s.get('phase') or 'working'}, {s.get('generated')} tokens so far)"
+                         if s.get("busy") else "nothing is running")
+                print(f"[maya] WARNING: {waiting} request(s) have waited for the engine for up to {oldest:.0f} s and "
+                      f"{doing}; {self.fifo.held_by()}, {active} request(s) counted active. A request that holds the "
+                      f"engine and waits on it for ever stops every request behind it - STRATA_REQUEST_QUIET_S / "
+                      f"STRATA_DRAIN_S bound those waits, so this line is what a wedged FIFO would look like. "
+                      f"Queue state: GET /status, /metrics (queued, active).", flush=True)
+
+        self._queue_watch = threading.Thread(target=loop, daemon=True, name="strata-queue-watch")
+        self._queue_watch.start()
 
     def _gpu_busy(self) -> bool:
         """Any of the engine's GPUs busier than STALL_GPU_BUSY in the telemetry's last sample (one a second)."""
@@ -1959,6 +2110,10 @@ class Service:
                                 getattr(self.engine, "info", {}) or {}),
             "activity": {"requests": totals["requests"] + max(int(busy), active),
                          "in_flight": max(int(busy), active) + int(s.get("queued") or 0),
+                         # the FIFO's state: a queue whose first waiter is old while nothing runs is stuck, not busy
+                         "queue": {"waiting": int(s.get("queued") or 0),
+                                   "first_waited_s": round(self.fifo.oldest_wait(), 1),
+                                   "places": self.fifo.capacity},
                          "last_request_at": int(last_at) if last_at else None},
             "last_timings": last_t,
             "machine": {
@@ -2126,18 +2281,20 @@ class Service:
 
     @contextlib.contextmanager
     def _turn(self, hold, cancel=None, units=1):
-        """The engine's turn for one request: the FIFO, given back at the end unless a fair slice already did."""
+        """The engine's turn for one request: the FIFO, given back at the end unless a fair slice already did.  The
+        place is taken (and given up) inside the try: an exception while waiting - a FIFO that throws instead of
+        waiting - left it in the line for ever, and every request behind it waited for a turn nothing would take."""
         place = None
-        if cancel is None:
-            self.fifo.acquire(units=units)
-            hold[0] = True
-        else:
-            place = self.fifo.enqueue(units=units)
-            while not cancel.is_set():
-                if self.fifo.wait_turn(place, timeout=0.05):
-                    hold[0] = True
-                    break
         try:
+            if cancel is None:
+                self.fifo.acquire(units=units)
+                hold[0] = True
+            else:
+                place = self.fifo.enqueue(units=units)
+                while not cancel.is_set():
+                    if self.fifo.wait_turn(place, timeout=0.05):
+                        hold[0] = True
+                        break
             yield
         finally:
             if place is not None:
@@ -2268,14 +2425,21 @@ class Service:
         # Identity token: only a DONE line replaces engine.last, so a request that died, errored or was
         # disconnected must not have the PREVIOUS request's decode figures recorded as its own.
         engine_last0 = getattr(self.engine, "last", None)
-        counted, my_started, my_first = False, time.time(), None
+        counted, my_started, my_first, queued = False, time.time(), None, False
         with self.status_lock:
             self.status["queued"] += 1
+            queued = True                               # counted as waiting until its turn comes (below, or in finally)
         hold = [False, False]                           # holds the FIFO (fair slices let go of it); counts as active
+        asked = time.monotonic()
         try:
             with self._turn(hold, cancel):
                 with self.status_lock:
                     self.status["queued"] -= 1
+                    queued = False
+                waited = time.monotonic() - asked
+                if waited >= QUEUE_LOG_S:               # a long wait is worth a line: it is what a wedged FIFO looked like
+                    print(f"[maya] this request waited {waited:.0f} s for the engine "
+                          f"({self.fifo.waiting()} request(s) behind it)", flush=True)
                 if cancel.is_set():
                     yield "done", {"finish": "cancel", "completion_tokens": 0}
                     return
@@ -2455,6 +2619,8 @@ class Service:
                           f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
                     if os.environ.get("STRATA_DEBUG") and raw_ids:
                         print(f"[maya] raw: {self.tok.decode(raw_ids)!r}", flush=True)
+                if queued:                              # never started (a cancel, an error while waiting): not waiting now
+                    self.status["queued"] -= 1
                 if hold[1]:
                     hold[1] = False
                     self.active -= 1
@@ -3744,19 +3910,22 @@ class Server(ThreadingHTTPServer):
             super().handle_error(request, client_address)
 
 
-SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_HTTP_BACKLOG", "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S",
-              "STRATA_DS4_KEEP_THINKING") + RESPONSE_ENV_KEYS
+SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_REQUEST_QUIET_S", "STRATA_DRAIN_S", "STRATA_HTTP_BACKLOG",
+              "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S", "STRATA_DS4_KEEP_THINKING",
+              "STRATA_SERVER_LOG") + RESPONSE_ENV_KEYS
 
 
 def apply_server_env(cfg: dict) -> None:
     """The config's "env" entries this server reads itself (`--env` puts every setting there; the rest go to the
     engine): in effect before it starts."""
-    global ENGINE_STALL_S
+    global ENGINE_STALL_S, REQUEST_QUIET_S, DRAIN_S
     for k in SERVER_ENV:
         v = (cfg.get("env") or {}).get(k)
         if v is not None:
             os.environ[k] = str(v)
     ENGINE_STALL_S = _stall_seconds()
+    REQUEST_QUIET_S = _quiet_seconds()
+    DRAIN_S = _drain_seconds()
     Server.request_queue_size = _backlog()
 
 
@@ -3967,6 +4136,54 @@ def watch_parent(stop, stdin=None, getppid=None, poll: float = 1.0) -> None:
     threading.Thread(target=orphan, name="parent-pid", daemon=True).start()
 
 
+class ServerLogTee:
+    """stdout as it was, and the same text appended to the run's log (where the engine already writes its own lines).
+    This server only printed to the terminal, so a run whose window was closed - or that was started by a script - left
+    no record of what it did: a request that waited minutes for its turn, an engine restarted mid-session, a queue that
+    stopped moving.  That record is what a report of a stuck server needs."""
+
+    def __init__(self, stream, handle):
+        self.stream, self.handle = stream, handle
+        self.lock = threading.Lock()
+
+    def write(self, text):
+        with self.lock:
+            try:
+                self.handle.write(text)
+            except (OSError, ValueError):                # the log went away: the terminal still gets the line
+                pass
+        return self.stream.write(text)
+
+    def flush(self):
+        try:
+            self.stream.flush()
+        except (OSError, ValueError):
+            pass
+        with self.lock:
+            try:
+                self.handle.flush()
+            except (OSError, ValueError):
+                pass
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+def tee_server_log(path: str) -> None:
+    """This server's own lines (`[maya] ...`) go to `path` as well as this terminal (STRATA_SERVER_LOG=0: terminal
+    only).  The engine's stderr is already appended there, so the file tells both sides of a request."""
+    path = os.path.abspath(path)
+    if not path or isinstance(sys.stdout, ServerLogTee):
+        return
+    try:
+        handle = open(path, "a", encoding="utf-8", buffering=1)
+    except OSError as e:
+        print(f"[maya] this server's lines cannot also go to {path} ({e}): they stay on this terminal", flush=True)
+        return
+    print(f"[maya] this server's lines go to {path} too", flush=True)
+    sys.stdout = ServerLogTee(sys.stdout, handle)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
@@ -4005,6 +4222,13 @@ def main() -> int:
     maya_names.alias_env(os.environ)   # (MAYA_* settings under the names the code and the engine read)
     cfg = maya_names.env_in(json.loads(Path(a.config).read_text(encoding="utf-8-sig"))) if a.config else {}   # (a BOM: Notepad)
     apply_server_env(cfg)
+    # the server's own lines go to the run's log as well (the engine writes its stderr there): a run whose terminal
+    # was closed leaves the record a stuck queue needs (STRATA_SERVER_LOG=0 keeps them on the terminal only)
+    _srv_log = os.environ.get("STRATA_SERVER_LOG")
+    if _srv_log is None:
+        _srv_log = str(cfg.get("log") or "")
+    if _srv_log.strip().lower() not in ("", "0", "off", "no", "false", "none"):
+        tee_server_log(_srv_log)
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
