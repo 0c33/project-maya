@@ -400,11 +400,15 @@ in `lane-times.txt` beside the model's pack; later starts check them in a few mi
 again under load. Both lanes share the PC's memory, SSD and cores, so while answering the first tokens it also checks
 that streaming really is faster here, taking turns with the CPU lane alone (separately for tokens whose experts are all
 in RAM and tokens that read some from the SSD); where it is not at least 3% faster, it stops streaming and the times
-file keeps that verdict. It applies while answering (one token at a time), not while reading the prompt.
+file keeps that verdict. It applies while answering (one token at a time), not while reading the prompt. That check
+times each layer's lanes; a second one (v1.1.25, #329) times whole tokens - runs of 8 with streaming allowed and
+without - because the streamed experts' trips through the host memory can slow the rest of a token, which no layer's
+own timing sees; where whole tokens are not at least 3% faster with it, streaming stops (kept for the next start too).
 
 | Setting | Default | |
 | --- | --- | --- |
 | `MAYA_DS4_STREAM` | on (1) | `0`: every expert VRAM does not hold on the CPU, as before |
+| `DS4_STREAM_TOKEN_AB` | on (1) | `0`: the per-layer check alone decides, as in v1.1.24 |
 
 The engine's decode summary (`streamed to the GPU: N`) and the `pcie=` key of its STAT lines (experts a token
 streamed) show it at work; the start's log prints each format's times and how many of a token's experts it streams.
