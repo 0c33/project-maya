@@ -4,6 +4,32 @@ Every release is on GitHub (Releases) with these notes; every published change m
 dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.25 - 2026-10-23
+
+Several conversations at once on GLM get faster, DeepSeek keeps conversations across switches and restarts, and a
+batch of fixes - among them DeepSeek's EXL3 setup and its thinking budget.
+
+- **DeepSeek EXL3 setup** no longer stops at the pack step ("keeps dense weights in FP8", #376): since v1.1.21 every
+  fresh EXL3 setup did. A download already made carries on from the pack step.
+- **DeepSeek keeps conversations** across switches and restarts, so agents with sub-agents stop re-reading their
+  prompts: opt-in, `MAYA_DS4_SLOT_KEEP=1` (#356, @mrsirg97-rgb). A retried prompt or a re-rendered turn is taken back at
+  the conversation's checkpoints (#394, @mgabor3141).
+- **DeepSeek's thinking budget** (`thinking_budget` in the config) is kept: the reasoning ends there and the answer
+  follows (#363). A 1..100 `reasoning_effort` shows as itself at the start.
+- **DeepSeek decode:** the PCIe lane is now judged over whole decode steps too, and streams only where the token gets
+  faster (#329). `DS4_STREAM_TOKEN_AB=0` keeps the earlier check alone.
+- **GLM, several conversations at once** (`--parallel`, @somnergy): MTP drafting in the batched steps
+  (`MAYA_GLM_MULTI_MTP`, #385) and the rows' attention and small kernels in one launch (`MAYA_GLM_ROWS_ATTN` /
+  `_ROWS_SMALL`, #391); running requests keep decoding while a new prompt is read (`MAYA_GLM_PREFILL_INTERLEAVE` /
+  `_GAPS`, #386; `MAYA_GLM_PREFILL_MIN_CHUNKS`, #392); a conversation's system prompt is kept in a slot, so new
+  conversations restore it instead of reading it again (#387). All opt-in except #387's, which is on with the slots.
+- **GLM EXL3 prompts:** short chunks on the tensor cores, `MAYA_GLM_EXL3_MMA_ROWS_SHORT` - 2K-token prompts 28% faster
+  on the contributor's PC (#388, @somnergy).
+- **Fixes:** the server no longer answers "exceeds the context (0)" to every request after an engine that died could
+  not start again - each request tries again, or says why it cannot (#351); `--speed-calibration` measures DeepSeek's
+  DSpark drafter again (#393); the Monitor finds an engine started through a launcher (#398, @somnergy); the pack's MTP
+  message no longer reads as drafting off (#327); docs on the CPU lane's threads (#390, @somnergy).
+
 ## v1.1.24 - 2026-10-22
 
 A fix for DeepSeek on two NVIDIA GPUs under Windows, faster DeepSeek prompts on NVIDIA RTX 30 and newer and on RDNA 4,
