@@ -432,7 +432,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # (a version other than 1 is refused by its number); the split decode's groups (split_groups); where a read cuts to
   # keep its system prompt's state (prefix_cut): CPU only
   # (a version other than 1 is refused by its number); the split decode's groups (split_groups): CPU only
-  foreach(_t expert_profile_save_test expert_profile_version_test split_groups_test exl3_mma_rows_test prefix_cut_test mtp_rows_test)
+  # (a version other than 1 is refused by its number); the split decode's groups (split_groups); the pieces a prompt is
+  # read in between decode steps (prefill_pieces): CPU only
+  foreach(_t expert_profile_save_test expert_profile_version_test split_groups_test exl3_mma_rows_test prefix_cut_test mtp_rows_test prefill_pieces_test)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/${_t}.cpp")
       enable_testing()
       add_executable(${_t} tests/core/${_t}.cpp)

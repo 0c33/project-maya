@@ -19,6 +19,8 @@
 #include "glm_fast_state.hpp"
 
 #include "strata/core/exl3_mma_rows.hpp"
+#include "strata/core/prefill_chunks.hpp"
+#include "strata/core/prefill_gaps.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/cpu/kq_avx512.hpp"
@@ -4169,6 +4171,32 @@ bool Glm5Model::dump_state(const std::string& path) {
 }
 
 // ---------------------------------------------------------------- the prompt
+int Glm5Model::prefill_chunk_for(int64_t nn) const {   // (prefill's own choice below, prefill_min_chunks 1)
+    if (pf_ == nullptr || nn <= 0) return 0;
+    int Tmax = pf_->T;
+    for (const Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) {
+        if (m->pf_ == nullptr) return 0;
+        Tmax = std::min(Tmax, m->pf_->T);
+    }
+    return strata::core::prefill_chunk_len(nn, Tmax, split_next_ != nullptr, prefill_floor(nn, 1));
+}
+
+// The fewest chunks a split cuts a call of nn tokens into: the call's own floor (prefill_min_chunks, none under 256
+// tokens) or STRATA_GLM_PREFILL_MIN_CHUNKS's (strata/core/prefill_chunks.hpp), whichever is more; one GPU: 1
+int64_t Glm5Model::prefill_floor(int64_t nn, int call_min) const {
+    static const strata::core::PrefillMinChunks set = [] {
+        const strata::core::PrefillMinChunks s =
+            strata::core::prefill_min_chunks_parse(getenv("STRATA_GLM_PREFILL_MIN_CHUNKS"));
+        if (s.n > 1)
+            std::fprintf(stderr, "glm prefill: on a split a prompt-path call is cut into %d chunks at least, none under "
+                                 "%d tokens (MAYA_GLM_PREFILL_MIN_CHUNKS), so the parts pipeline it\n", s.n, s.min_tokens);
+        return s;
+    }();
+    if (split_next_ == nullptr) return 1;
+    return std::max(strata::core::prefill_floor_chunks(nn, call_min, 256),
+                    strata::core::prefill_floor_chunks(nn, set.n, set.min_tokens));
+}
+
 bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, int32_t next_token) {
     err.clear();
     prefill_next_ = next_token;
@@ -4186,11 +4214,14 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     // longer than the largest chunk is cut into EQUAL chunks (the parts of a split pipeline chunks)
     int Tmax = pf_->T;
     for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) Tmax = std::min(Tmax, m->pf_->T);
-    const int64_t nn = (int64_t) tokens.size(), nchunks = (nn + Tmax - 1) / Tmax;
+    const int64_t nn = (int64_t) tokens.size();
     // one GPU has no pipeline to balance: full chunks and the remainder last - every chunk stages nearly every expert,
-    // so 8449 tokens as 8192 + 257 cost about one chunk's experts, as two equal 4225s about two (240 -> ~300 tok/s)
-    const int Trun = split_next_ == nullptr ? (int) std::min<int64_t>(Tmax, (nn + 63) / 64 * 64)
-                                            : (int) std::min<int64_t>(Tmax, ((nn + nchunks - 1) / nchunks + 63) / 64 * 64);
+    // so 8449 tokens as 8192 + 257 cost about one chunk's experts, as two equal 4225s about two (240 -> ~300 tok/s).
+    // A split: equal chunks, prefill_floor of them at least (prefill_min_chunks, STRATA_GLM_PREFILL_MIN_CHUNKS)
+    const int Trun = prefill_force_chunk > 0
+                         ? std::min(Tmax, prefill_force_chunk)
+                         : strata::core::prefill_chunk_len(nn, Tmax, split_next_ != nullptr,
+                                                           prefill_floor(nn, prefill_min_chunks));
     bool ok = true;
     progress_at("the prompt: lending the expert pool's tail");   // (the serve watchdog's stages, issue #40)
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
@@ -4497,6 +4528,23 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         cudaStreamWaitEvent(H->fast_->copy, H->pf_->ev_hidle, 0);
         cudaSetDevice(owner->dev_);
     };
+    // STRATA_GLM_PREFILL_GAPS (prefill_gap): the other requests' decode at a chunk boundary of this read, every part
+    // idle - not with the dual-link prompt (a part's helper works in the other part's memory) nor with the waiting
+    // part computing a share (STRATA_GLM_PREFILL_CALC: its buffers and turns span the halves)
+    const bool gaps = np > 1 && !dual && !calc && prefill_gap && prefill_gap_wanted;
+    uint64_t gaps_run = 0;
+    double gaps_ms = 0.0;
+    // one gap: 0 go on, else the read ends (e: "cancelled" for 1)
+    const auto run_gap = [&](std::string& e) -> int {
+        const auto g0 = std::chrono::steady_clock::now();
+        const int r = prefill_gap();
+        cudaSetDevice(dev_);
+        ++gaps_run;
+        gaps_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g0).count();
+        if (r == 1) e = "cancelled";
+        else if (r != 0) e = "glm prefill: the decode between the prompt's chunks failed";
+        return r;
+    };
     if (!pipelined) {
         // one half after the other, chunk by chunk
         for (int c = 0; c < nc; ++c) {
@@ -4517,6 +4565,17 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) {
                 PrefillState* SP = prev->pf_;
                 const size_t hop = (size_t) T * 4 * E * sizeof(float);
+                // (gaps: between two parts' halves of the chunk - the earlier part done, the later one not begun)
+                if (gaps && prefill_gap_wanted()) {
+                    cudaSetDevice(prev->dev_);
+                    if (!glmfast::cuda_ok(cudaStreamSynchronize(prev->fast_->cs), "glm prompt gap", err)) return false;
+                    const int r = run_gap(err);
+                    if (r == 1) {
+                        cancelled = true;
+                        break;
+                    }
+                    if (r != 0) return false;
+                }
                 cudaSetDevice(prev->dev_);
                 cudaMemcpyAsync(SP->hop_h, SP->R, hop, cudaMemcpyDeviceToHost, prev->fast_->cs);
                 cudaEventRecord(SP->ev_hop, prev->fast_->cs);
@@ -4538,6 +4597,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                     return false;
                 prev = m;
             }
+            if (cancelled) break;
             pos_ = p0 + T;
             for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) m->pos_ = pos_;
             ++pf_->chunks;
@@ -4554,6 +4614,8 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         std::condition_variable cv;
         // produced[k]: chunks part k has put in its slots; consumed[k]: chunks part k + 1 has copied out of them
         std::vector<int> produced((size_t) np, 0), consumed((size_t) np, 0);
+        // gaps: the chunks each part has read and the boundaries released (strata/core/prefill_gaps.hpp)
+        strata::core::PipelineGaps G(np, nc);
         bool stop = false;
         std::string stage_err;
         const size_t slot = (size_t) Tc * 4 * E;
@@ -4594,7 +4656,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                 for (int c = 0; c < nc; ++c) {
                     {
                         std::unique_lock<std::mutex> lk(mu);
-                        cv.wait(lk, [&] { return produced[(size_t) k - 1] > c || stop; });
+                        cv.wait(lk, [&] { return (produced[(size_t) k - 1] > c && (!gaps || G.may_start(k, c))) || stop; });
                         if (stop) return;
                     }
                     const int T = chunk_len(c);
@@ -4624,8 +4686,17 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                         fail(e2.empty() ? "glm prefill: part " + std::to_string(k) + " failed" : e2);
                         return;
                     }
+                    // (gaps: a part has read its chunk once its stream is synchronized - the hop out does it here)
+                    const auto read_done = [&] {
+                        {
+                            std::lock_guard<std::mutex> lk(mu);
+                            G.finished[(size_t) k] = c + 1;
+                        }
+                        cv.notify_all();
+                    };
                     if (k + 1 < np) {
                         if (!hand_on(k, c, T)) return;
+                        read_done();
                         continue;
                     }
                     if (!glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->cs), "glm prompt pipeline", e2)) {
@@ -4637,6 +4708,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                         fail("cancelled");
                         return;
                     }
+                    read_done();
                 }
             });
         cudaSetDevice(dev_);
@@ -4657,6 +4729,27 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             }
             if (!hand_on(0, c, T)) break;
             ++pf_->chunks;
+            // gaps: boundary c - once every later part has read its chunk before it, the other requests decode, then
+            // the parts go on (part 1 with chunk c, this thread with c + 1)
+            if (gaps && c + 1 < nc) {
+                if (prefill_gap_wanted()) {
+                    {
+                        std::unique_lock<std::mutex> lk(mu);
+                        cv.wait(lk, [&] { return G.all_idle(c) || stop; });
+                        if (stop) break;
+                    }
+                    std::string e0;
+                    if (run_gap(e0) != 0) {
+                        fail(e0);
+                        break;
+                    }
+                }
+                {
+                    std::lock_guard<std::mutex> lk(mu);
+                    G.released = c;
+                }
+                cv.notify_all();
+            }
         }
         for (auto& t : later) t.join();
         if (stop) {
@@ -4746,6 +4839,9 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                                  "(cumulative)\n", (unsigned long long) xe, (unsigned long long) xr, sh.c_str());
         }
     }
+    if (gaps_run > 0)
+        std::fprintf(stderr, "glm prefill: %lld tokens in %.1f ms with %llu decode gaps (%.1f ms of them, %.0f%%)\n",
+                     (long long) n, ms, (unsigned long long) gaps_run, gaps_ms, 100.0 * gaps_ms / std::max(1.0, ms));
     return true;
 }
 
