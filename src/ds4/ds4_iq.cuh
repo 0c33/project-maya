@@ -19,7 +19,7 @@
 namespace strata::ds4::gguf::iq {
 
 // ggml type ids
-constexpr int kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kIQ2_XXS = 16, kIQ3_XXS = 18, kIQ1_S = 19, kIQ3_S = 21,
+constexpr int kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kQ5_K = 13, kIQ2_XXS = 16, kIQ2_XS = 17, kIQ3_XXS = 18, kIQ1_S = 19, kIQ3_S = 21,
               kIQ2_S = 22, kIQ4_XS = 23, kIQ1_M = 29;
 
 /// Whether the device kernels take this ggml type.

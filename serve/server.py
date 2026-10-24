@@ -1322,17 +1322,56 @@ class Vision:
                 self.cache.pop(old)[0].unlink(missing_ok=True)
             return self.cache[key]
 
+    VIDEO_FPS = 4.0                                        # (llama.cpp's mtmd default: the frames a second it reads)
+
+    @staticmethod
+    def video_container(data: bytes) -> str | None:
+        """The container a video's first bytes name - MP4 / MOV, WebM / MKV or AVI - else None.  Only those reach
+        ffmpeg: anything else (a playlist is text) could make it open other files or URLs while it reads."""
+        if data[4:8] in (b"ftyp", b"moov", b"mdat", b"wide", b"free", b"skip"):
+            return "mp4"
+        if data[:4] == b"\x1a\x45\xdf\xa3":
+            return "webm"
+        if data[:4] == b"RIFF" and data[8:12] == b"AVI ":
+            return "avi"
+        return None
+
+    @staticmethod
+    def video_seconds(path: Path) -> float | None:
+        """A video file's duration by ffprobe (files only - no other protocol), None when it does not say."""
+        try:
+            r = subprocess.run(["ffprobe", "-v", "error", "-protocol_whitelist", "file", "-show_entries",
+                                "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+                               capture_output=True, text=True, timeout=30)
+            return float(r.stdout.strip().splitlines()[0]) if r.returncode == 0 and r.stdout.strip() else None
+        except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+            return None
+
     def encode_video(self, source: str) -> tuple[Path, list[int]]:
         """-> (embeddings file, the frames' token counts), one SVE1 record per frame."""
+        import shutil
+        if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+            raise ValueError("videos need ffmpeg and ffprobe on this PC (Linux: sudo apt install ffmpeg; Windows: winget "
+                             "install Gyan.FFmpeg; macOS: brew install ffmpeg), then restart Maya")
         data = self.load(source)
+        if self.video_container(data) is None:
+            raise ValueError("this video's format is not one Maya reads: send MP4, MOV, WebM, MKV or AVI")
         key = hashlib.sha256(data).hexdigest()[:32]
         with self.lock:
             if key in self.cache:
                 return self.cache[key]
-            if self.proc is None:
-                self._start()
             vid, out = self.dir / f"{key}.vid", self.dir / f"{key}.sve"
             vid.write_bytes(data)
+            # a long video is many frames (every one an image's tokens): refused before it is decoded
+            limit = max(1, int(os.environ.get("STRATA_VIDEO_MAX_FRAMES", "240") or 240))
+            seconds = self.video_seconds(vid)
+            if seconds is not None and seconds * self.VIDEO_FPS > limit:
+                vid.unlink(missing_ok=True)
+                raise ValueError(f"the video is {seconds:.0f} s long: {seconds * self.VIDEO_FPS:.0f} frames at "
+                                 f"{self.VIDEO_FPS:g} a second, more than the {limit} Maya reads (MAYA_VIDEO_MAX_FRAMES "
+                                 f"sets it; every frame takes an image's share of the context)")
+            if self.proc is None:
+                self._start()
             self.proc.stdin.write(f"VID {vid} {out}\n")
             self.proc.stdin.flush()
             line = self.proc.stdout.readline().strip()
@@ -3541,7 +3580,10 @@ def make_handler(svc: Service):
                     model = {"id": svc.model, "object": "model",
                              "status": {"value": "loaded" if loaded else "unloaded"},
                              "meta": {"n_ctx": svc.engine.max_context},
-                             "architecture": {"input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
+                             # (videos: the llama.cpp encoder's - GLM's; DeepSeek's encoder reads pictures only)
+                             "architecture": {"input_modalities": ["text"] if svc.vision is None else
+                                              ["text", "image", "video"] if isinstance(svc.vision, Vision) else
+                                              ["text", "image"],
                                               "output_modalities": ["text"]}}
                     self._json(200, {"object": "list", "data": [model] if loaded or svc.unloaded else []})
             elif path == "/props":
@@ -4183,11 +4225,27 @@ def watch_parent(stop, stdin=None, getppid=None, poll: float = 1.0) -> None:
     ended and init or a subreaper took the server).  Both watch from threads of their own."""
     src = stdin if stdin is not None else getattr(sys.stdin, "buffer", None)
 
+    def closed_polling():
+        # Windows: the CRT keeps a descriptor's lock for a whole blocking read(), and the first `import numpy` (a
+        # picture, in a request's thread) waits on stdin's: the server froze (#444).  Polling the pipe holds no lock.
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        h = wintypes.HANDLE(msvcrt.get_osfhandle(src.fileno()))
+        avail = wintypes.DWORD()
+        while k32.PeekNamedPipe(h, None, 0, None, ctypes.byref(avail), None):
+            if avail.value:
+                src.read1(avail.value)
+            time.sleep(0.25)
+        return ctypes.get_last_error() == 109      # ERROR_BROKEN_PIPE: the parent's end is closed
+
     def eof():
         try:
-            while src.read(1 << 12):
-                pass
-        except (OSError, ValueError):
+            if not (os.name == "nt" and stdin is None and closed_polling()):
+                while src.read(1 << 12):
+                    pass
+        except (OSError, ValueError, AttributeError):
             pass
         stop("the program that started it ended")
     if src is not None:
