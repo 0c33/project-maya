@@ -4,6 +4,33 @@ Every release is on GitHub (Releases) with these notes; every published change m
 dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.27 - 2026-10-24
+
+DeepSeek decodes up to twice as fast on PCs whose RAM holds its experts, GLM reads whole videos, and fixes for a
+Windows server that froze on the first picture and for DeepSeek's calibration.
+
+- **DeepSeek decode where the RAM holds the experts:** `--mmap-experts auto` (the default) now copies a GGUF's CPU-lane
+  experts into RAM when all of them fit with room to spare, instead of reading them from the model's files at every
+  token. Reported on #339 and #441: +22% on four V100s with 504 GB, about 2x on a 20 GB card with 255 GB, +23% on four
+  RTX 3090s with 126 GB; +23% on three V100s here. With less RAM nothing changes (a part copied was measured slower);
+  `--mmap-experts on` keeps them in the files.
+- **GLM reads whole videos** (#248, @kabachuha): send a video like a picture (OpenAI `video_url`, Anthropic `video`);
+  its frames, 4 a second, go through the picture encoder. Needs ffmpeg and ffprobe on the PC (Linux: `sudo apt install
+  ffmpeg`; Windows: `winget install Gyan.FFmpeg`). Only real video files reach ffmpeg (MP4, MOV, WebM, MKV, AVI), and a
+  video longer than `MAYA_VIDEO_MAX_FRAMES` frames (240, a minute) is refused before it is decoded.
+- **Windows: the server froze on the first picture** (#444, @DikiyLifter): the thread that watches the starting program
+  held stdin's lock in a blocking read, and the first picture's `import numpy` waited on it forever. The pipe is now
+  polled. Every version since v1.1.18 was affected.
+- **GLM decode on Volta** (#459, @merbanan): the decode's sparse attention on the V100's tensor cores - its attention
+  ~4x faster, decode a few percent. `MAYA_GLM_MLA_V70=0` turns it off.
+- **DeepSeek calibration** tests the CPU-lane thread counts whenever the lane has threads, fewer than every CPU first
+  (#433, @talisp: one GPU went from 15 to 41 tok/s with fewer threads, and `--calibrate` had skipped the test).
+- **Fixes:** with `MAYA_DS4_TP_GGUF_UNEVEN` the busy experts' buffers are sized for the widest layer, so a 2-GPU tensor
+  parallel no longer fails on the first request (#446, @pepuscz; #439); the busy experts' FP16 path takes only the
+  experts already in VRAM; IQ1_M experts on the CPU lane up to 14x faster, the same results to the bit (#452, @Whamp);
+  DeepSeek GGUFs with IQ2_XS experts (from #357, @OscarSheng), Q5_K dense weights or IQ4_NL Engram tables load, and
+  an Engram table in a format the engine cannot read stops the load with a message instead of crashing.
+
 ## v1.1.26 - 2026-10-23
 
 DeepSeek reads prompts up to 1.5x faster on NVIDIA V100s and faster on every NVIDIA GPU, its long tool calls stream,
