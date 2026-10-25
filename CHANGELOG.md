@@ -4,6 +4,25 @@ Every release is on GitHub (Releases) with these notes; every published change m
 dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.28 - 2026-10-25
+
+DeepSeek decodes faster on a single NVIDIA GPU and reaches its full 1M context, the chat stays steady while it writes
+long code, and AMD and multi-GPU setups get new opt-in options.
+
+- **Faster DeepSeek decode on one NVIDIA GPU** (#476, @RubenTorney): when the PC's RAM holds the experts, the GPU now
+  gets the experts it needs much more efficiently and keeps more of them close at hand. Up to about 2x decode reported
+  on an RTX 3090, +14% on a V100 here and +35% with less VRAM free; prompts read at the same speed. It is on for Linux
+  with one NVIDIA GPU; Windows, AMD and multi-GPU setups keep the previous path, and the start's log says which runs.
+- **DeepSeek 512K and 1M contexts** (#442, @needmorevram): the setup and the dashboard now offer the model's full
+  context. A longer context takes VRAM from the experts, and a prompt that long takes a while to read.
+- **A steadier chat while it streams** (#478, @needmorevram): long code answers no longer flash or jump, scrolling up
+  stops the chat following the answer, and the sidebar shows the model's logo and name.
+- **GLM on AMD, opt-in** (#454, #455, #456, #457, @pepuscz): the expert helper now works beside a layer split, Maya-M's
+  experts can run on a tuned RDNA kernel, the profiler shows attention in more detail, and alternative decode
+  attention kernels give the same results to the bit. With these settings off nothing changes (`docs/SETTINGS.md`).
+- **DeepSeek on several GPUs, opt-in** (#412, #415, @pepuscz): the DSpark drafter can be spread over a tensor-parallel
+  group to free room on the first GPU, and a helper GPU can take the experts VRAM cannot hold (Linux). Off by default.
+
 ## v1.1.27 - 2026-10-24
 
 DeepSeek decodes up to twice as fast on PCs whose RAM holds its experts, GLM reads whole videos, and fixes for a
