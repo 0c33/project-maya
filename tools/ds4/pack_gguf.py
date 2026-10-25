@@ -368,6 +368,11 @@ def main() -> int:
     ap.add_argument("--out", help="default: <model>/maya-ds4")
     ap.add_argument("--vision", help="vision_pack.py's folder (default: <model>/../vision; taken when it is there)")
     ap.add_argument("--drafter", help="the DSpark drafter's .json (drafter_pack.py's; default <model>/../dspark/dspark.json)")
+    ap.add_argument("--partial-split", action="store_true", help="with --engram: accept a split whose Engram-only "
+                    "shards are not here (strata-ab: Maya-XS shards 1-3 + ISTA-DASLab's IQ4_NL Engram)")
+    ap.add_argument("--engram-meta", help="a GGUF of the same model whose metadata carries the Engram's hash parameters "
+                    "(llama.cpp's ple.* / engram.*), for a quant whose shards leave them out (ISTA-DASLab's GSQ-RCO sets: "
+                    "unsloth's 5.8 MB UD-Q8_K_XL shard 1); as Strata's tools/dsv41/pack_gguf.py (strata-ab port)")
     ap.add_argument("--engram", help="the folder of the Engram tables' GGUF set, for a quant that leaves them out "
                                      "(default: <model>/../Engram, when it is whole)")
     ap.add_argument("--shards", nargs="+", help="the GGUF's files in --model (default: every .gguf there - one "
@@ -387,12 +392,20 @@ def main() -> int:
     if kv is None or kv["general.architecture"] not in ("deepseek41",):
         raise SystemExit("%s: not a DeepSeek-V4.1 GGUF (architecture %r)" % (model, kv and kv.get("general.architecture")))
     split = int(kv.get("split.count", 1))
+    if a.partial_split and a.engram and split > len(gs):   # (strata-ab: a Maya quant's Engram-only shards left out,
+        print("%d of the %d shards: the missing ones are taken as the Engram tables' (from --engram)" % (len(gs), split))
+        split = len(gs)                                     #  the tables come from --engram; every table is checked below)
     if split != len(gs):
         counts = sorted({m.group(1) for m in (re.search(r"-of-(\d{5})\.gguf$", p.name) for p in shards) if m})
         raise SystemExit("%s: %d of the %d shards are here" % (model, len(shards), split) if len(counts) < 2 else
                          "%s: the shards of more than one GGUF split (-of-%s): name the model's own with --shards" %
                          (model, ", -of-".join(counts)))
     newer_keys(gs, kv)
+    if a.engram_meta:   # (strata-ab: Strata 0.2.4's --engram-meta, for the IST-DAS sets)
+        mg = Gguf(pathlib.Path(a.engram_meta).expanduser().resolve())
+        for k, v in mg.kv.items():
+            if ".engram." in k or ".ple." in k or k.endswith(".embedding_length_per_layer_input") or ".dspark." in k:
+                kv.setdefault(k, v)   # (.dspark.: the drafter's geometry, which the IST-DAS shards leave out too)
     ple_to_engram(kv)
     for g in gs:
         split_ple(g, kv)
