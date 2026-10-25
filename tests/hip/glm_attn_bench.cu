@@ -325,7 +325,11 @@ void mla_timing(MlaInputs& M, const std::vector<std::string>& shapes, const std:
 int main(int argc, char** argv) {
     // whole lines: the engine's records go to stderr (unbuffered) while these rows go to stdout - block-buffered into a
     // file, a record landed inside a row (0400Z raw line 354); line-buffered, each row is one write between them
+#if defined(_WIN32)
+    std::setvbuf(stdout, nullptr, _IONBF, 0);   // (MSVC's CRT has no line buffering, and _IOLBF with size 0 aborts)
+#else
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
+#endif
     bool parity_only = false, sweep = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];

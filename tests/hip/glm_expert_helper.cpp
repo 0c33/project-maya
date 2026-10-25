@@ -11,6 +11,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+#if defined(_WIN32)   // (the test switches the helper's settings between runs: POSIX setenv / unsetenv on Windows)
+static int setenv(const char* k, const char* v, int) { return _putenv_s(k, v); }
+static int unsetenv(const char* k) { return _putenv_s(k, ""); }
+#endif
 #include <random>
 #include <vector>
 

@@ -14,6 +14,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -815,8 +816,13 @@ bool own(int type) {
     return false;
 #endif
 }
+// iq_cpu_iq1s_rows: whether IQ1_S may take its own rows at all (the engine's one-GPU decode path)
+std::atomic<bool> g_iq1_on{true};
 // own(type) for a call of nt tokens: IQ1_S's rows only from 2 tokens on (one token: ggml-cpu's dot, as fast)
-bool own_nt(int type, int nt) { return own(type) && (type != GGML_TYPE_IQ1_S || nt >= 2); }
+bool own_nt(int type, int nt) {
+    if (type == GGML_TYPE_IQ1_S && (nt < 2 || !g_iq1_on.load(std::memory_order_relaxed))) return false;
+    return own(type);
+}
 }  // namespace
 
 bool iq_cpu_fmt(int tg, int td, int n_embd, int n_ff, IqCpu& f, std::string& err) {
@@ -884,6 +890,7 @@ void iq_cpu_down(const IqCpu& f, const uint8_t* down, const void* const* hq, int
 }
 
 bool iq_cpu_own_rows(int type) { return own(type); }
+void iq_cpu_iq1s_rows(bool on) { g_iq1_on.store(on, std::memory_order_relaxed); }
 #else
 bool iq_cpu_fmt(int, int, int, int, IqCpu&, std::string& err) {
     err = "this build has no ggml-cpu (STRATA_NATIVE_EXPERTS=OFF): the low-bit experts' CPU lane is not in it";
@@ -894,6 +901,7 @@ void iq_cpu_gate_up(const IqCpu&, const uint8_t*, const uint8_t*, const void* co
                     float) {}
 void iq_cpu_down(const IqCpu&, const uint8_t*, const void* const*, int, float* const*, int, int) {}
 bool iq_cpu_own_rows(int) { return false; }
+void iq_cpu_iq1s_rows(bool) {}
 #endif
 
 }  // namespace strata::ds4::gguf

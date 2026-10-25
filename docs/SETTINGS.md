@@ -412,8 +412,10 @@ lanes; a second one (v1.1.25, #329) times whole tokens - runs of 8 with streamin
 streamed experts' trips through the host memory can slow the rest of a token, which no layer's own timing sees; where
 whole tokens are not at least 3% faster with it, streaming stops (kept for the next start too).
 
-Where the CPU lane's experts are copied into RAM (`--mmap-experts auto` when they all fit, or `off`) on one NUMA node and
-a discrete NVIDIA GPU under Linux, the copies are pinned and mapped, and the GPU pulls a streamed expert straight from
+On Linux with one discrete NVIDIA GPU (a single GPU, no helper GPU - where this path was measured; Windows, AMD and
+several GPUs keep v1.1.27's path unless the settings below are set to 1, and the start's log says which path it
+took): where the CPU lane's experts are copied into RAM (`--mmap-experts auto` when they all fit, or `off`) on one
+NUMA node, the copies are pinned and mapped, and the GPU pulls a streamed expert straight from
 its copy: it is no longer read into the pinned staging first, so it crosses the RAM once instead of three times and
 takes none of the CPU's cores. With DSpark, most of the answer is decoded in verify windows of several tokens; their
 experts stream too (up to 16 a layer), not only a single token's. A streamed expert then stays in VRAM: it lands in
@@ -425,10 +427,10 @@ windows. The stream lane's time is measured on the GPU itself. On an RTX 3090 + 
 | --- | --- | --- |
 | `MAYA_DS4_STREAM` | on (1) | `0`: every expert VRAM does not hold on the CPU, as before |
 | `DS4_STREAM_TOKEN_AB` | on (1) | `0`: the per-layer check alone decides, as in v1.1.24 |
-| `DS4_STREAM_ZC` | on (1) | `0`: copied experts pass the pinned staging, as before (the GPU does not pull them in place) |
-| `DS4_STREAM_WIN` | on (1) | `0`: verify windows do not stream (a single token's experts only, as before) |
+| `DS4_STREAM_ZC` | on with one NVIDIA GPU on Linux | `0`: copied experts pass the pinned staging, as before (the GPU does not pull them in place) |
+| `DS4_STREAM_WIN` | on with one NVIDIA GPU on Linux | `0`: verify windows do not stream (a single token's experts only, as before) |
 | `DS4_STREAM_SLOTS` | 16 | a verify window's streamed experts at most, a layer (1-16) |
-| `DS4_LAND` | on (1) | `0`: a streamed expert does not stay in VRAM, and a GGUF gets no recent slots |
+| `DS4_LAND` | on with one NVIDIA GPU on Linux | `0`: a streamed expert does not stay in VRAM, and a GGUF gets no recent slots |
 | `DS4_RECENT` | 32 (a GGUF: with `DS4_LAND`) | the recent slots a layer (VRAM slots taken from the profile's coldest experts) |
 | `MAYA_DS4_PIN_BY_NEED` | off (0) | where the system cannot lock every expert copied into RAM for the GPU (Windows locks about half the RAM): `1` pins them a layer at a time, the layers whose copies the routing profile uses most first, until a pin fails or `MAYA_DS4_PIN_GB` is reached; the GPU pulls those in place, the rest go through the staging. Without it a pin that fails leaves every copy to the staging (an RTX 3090, Maya-XS, 101 GB of copies held to 50 GB pinned: decode 16.3 -> 20.3 tokens/s; all of them pinned: 29.0). A GPU that does not address registered memory at its host address (Windows' WDDM) takes its mapped address, with one GPU |
 | `MAYA_DS4_PIN_GB` | 0 (no cap) | with `MAYA_DS4_PIN_BY_NEED`: pin at most this many GB of the copies |
@@ -588,11 +590,13 @@ those instead: `MAYA_DS4_HELPER=<visible GPU>` with `MAYA_DS4_HELPER_GB=<GB>` gi
 experts the layer GPUs do not hold (by the expert profile). Its picks run on its own stream from the window's plan
 (decode and a DSpark verify window), the CPU lane's service thread adds the sums, and a failure or a 10 s silence hands
 the picks back to the CPU lane. An expert is summed on the helper instead of the CPU lane, so its output can differ in
-the last bits. The DeepSeek counterpart of GLM's `STRATA_GLM_EXPERT_HELPER` (#201).
+the last bits. The DeepSeek counterpart of GLM's `MAYA_GLM_EXPERT_HELPER` (#201). **Linux only (tested); Windows +
+AMD untested** - there AMD's driver starts queued GPU work only when the host waits, so the helper is likely to
+stay silent past the 10 s limit and hand its picks back to the CPU lane.
 
 | Setting | Default | |
 | --- | --- | --- |
-| `MAYA_DS4_HELPER` | off | the helper's visible GPU index (not one of `--gpus`); with `MAYA_DS4_HELPER_GB` |
+| `MAYA_DS4_HELPER` | off | the helper's visible GPU index (not one of `--gpus`); with `MAYA_DS4_HELPER_GB`. Linux only (tested); Windows + AMD untested |
 | `MAYA_DS4_HELPER_GB` | - | its experts' pool, GB |
 | `MAYA_DS4_WARM_CAP_GB` | - | required with the helper: the load's experts in host RAM, GB, beside the pool (an integrated GPU's pool is host RAM too); ignored under `DS4_REQUIRE_ALL_RAM=1` (every expert in RAM) |
 | `MAYA_DS4_HELPER_CHECK` | off | `1`: at load, two tokens per expert format through the helper against the CPU lane, and its grouped window path against its per-token one, bit for bit |

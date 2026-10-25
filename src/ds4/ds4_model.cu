@@ -1284,11 +1284,17 @@ struct Model::Impl {
     std::vector<size_t> ram_chunk_bytes;
     bool ram_pinned = false;   // the slots are pinned memory (the prompt path DMAs them from where they lie)
     bool ln_zc = false;        // the stream lane pulls the CPU lane's copied experts in place (zc_pin)
-    // DS4_STREAM_WIN (default on): a verify window's CPU-lane experts stream too (lane_take_win), not a token's alone
-    bool ln_win = std::getenv("DS4_STREAM_WIN") == nullptr || std::atoi(std::getenv("DS4_STREAM_WIN")) != 0;
+    // the one-GPU decode path (one_gpu_path, at load): the copies pulled in place (DS4_STREAM_ZC), a verify window's
+    // experts streamed (DS4_STREAM_WIN), streamed experts kept in a GGUF's recent slots (DS4_LAND), the wait for the
+    // recent slots' fills before a prompt (rc_drain) and IQ1_S's multi-token CPU rows - on by default only where they
+    // were measured: Linux, NVIDIA, one discrete GPU (a group of one), no helper GPU.  Elsewhere v1.1.27's path; each
+    // setting given explicitly (1 / 0) still decides for itself
+    bool ln_one = false;
+    // DS4_STREAM_WIN (default: ln_one): a verify window's CPU-lane experts stream too (lane_take_win), not a token's alone
+    bool ln_win = false;
     // DS4_STREAM_SLOTS: a window's streamed experts at most (pcie::kSlots, 16) - more than the device pulls while
     // the CPU lane computes the rest only queue on it
-    bool ln_land = std::getenv("DS4_LAND") == nullptr || std::atoi(std::getenv("DS4_LAND")) != 0;
+    bool ln_land = false;   // DS4_LAND (default: ln_one)
     int ln_win_max = std::getenv("DS4_STREAM_SLOTS") != nullptr
                          ? std::max(0, std::min(pcie::kSlots, std::atoi(std::getenv("DS4_STREAM_SLOTS"))))
                          : pcie::kSlots;
@@ -2584,6 +2590,7 @@ struct Model::Impl {
         if (dc != nullptr) chunk = prompt_par ? std::atoi(dc) : 0;
         else if (chunk > 0 && o.prefill_chunk < 0) chunk = chunk_default(chunk);
         if (const char* v = std::getenv("DS4_CHUNK_MIN")) chunk_min = std::max(1, std::atoi(v));
+        one_gpu_path();   // (the devices, their groups and the helper GPU known: before the recent slots' count)
         // (a GGUF: 32 too while streamed experts land in them, DS4_LAND - the link's bytes stay in VRAM)
         recent_n = std::max(0, (int) env_f("DS4_RECENT", chunk > 0 && (!file_experts || (pk.gguf && ln_land)) ? 32.0f : 0.0f));
         if (chunk > 0) {
@@ -5584,9 +5591,39 @@ struct Model::Impl {
         }
         return true;
     }
+    // ln_one and the settings that follow it (see ln_one): Linux + NVIDIA + one discrete GPU in a group of its own and
+    // no helper GPU - the setup #476's path was measured on.  Windows, AMD, several GPUs or groups, an integrated GPU or
+    // a helper GPU: off, as in v1.1.27 (DS4_STREAM_WIN / DS4_LAND / DS4_STREAM_ZC = 1 turn one on anyway, 0 off)
+    static int env_tri(const char* name) {   // -1: not set, else its value != 0
+        const char* v = std::getenv(name);
+        return v == nullptr || v[0] == '\0' ? -1 : std::atoi(v) != 0;
+    }
+    void one_gpu_path() {
+        bool one = false;
+#if !defined(STRATA_USE_HIP) && !defined(_WIN32)
+        one = devs.size() == 1 && groups.size() == 1 && groups[0].mem.size() == 1 && helper_id < 0;
+        if (one) {
+            cudaDeviceProp pr{};
+            one = cudaGetDeviceProperties(&pr, devs[0].id) == cudaSuccess && pr.integrated == 0;
+            if (!one) (void) cudaGetLastError();
+        }
+#endif
+        ln_one = one;
+        const int w = env_tri("DS4_STREAM_WIN"), d = env_tri("DS4_LAND");
+        ln_win = w < 0 ? one : w != 0;
+        ln_land = d < 0 ? one : d != 0;
+        gg::iq_cpu_iq1s_rows(one);
+        if (pk.gguf)
+            std::fprintf(stderr, "ds4: the one-GPU decode path (in-place pulls, windows streamed, landings): %s%s%s\n",
+                         one ? "on (Linux, NVIDIA, one GPU)" : "off (v1.1.27's path: not Linux + NVIDIA + one GPU)",
+                         w >= 0 ? (w ? ", DS4_STREAM_WIN=1" : ", DS4_STREAM_WIN=0") : "",
+                         d >= 0 ? (d ? ", DS4_LAND=1" : ", DS4_LAND=0") : "");
+    }
     bool zc_allowed() const {
         const char* v = std::getenv("DS4_STREAM_ZC");
         if ((v != nullptr && std::atoi(v) == 0) || lane_env_off() || !pk.gguf) return false;
+        // (off the one-GPU path: only when asked - DS4_STREAM_ZC=1, or MAYA_DS4_PIN_BY_NEED's own opt-in)
+        if (!ln_one && v == nullptr && !pin_by_need) return false;
         for (const LaneDev& D : ln_dev)   // (an integrated GPU's kernels may read the staging in place: theirs)
             if (D.integrated) return false;
         return zc_host_ptr() || (pin_by_need && devs.size() == 1);
@@ -7316,9 +7353,23 @@ struct Model::Impl {
     // before a run of chunks borrows the tail (borrow_begin): the recent slots lie in it, so no fill may still be
     // writing there - every one waited for, then the fills done and the window's landings mapped (no new fills): the
     // run's buffers then cover only mapped experts, which borrow_end reads back like any other VRAM one
+    // At most kRcDrainMs: a fill held for its device's next turn (copy_open - none comes while the prompt waits here) or
+    // a stalled copy must not hang the prompt, so past it the prompt goes on as in v1.1.27 (no wait, nothing mapped
+    // now: the next tick maps what landed).  The wait itself makes no GPU call.
+    static constexpr double kRcDrainMs = 5000.0;
     void rc_drain() {
         if (recent_n <= 0 || rc_cs.empty()) return;
-        while (rc_pending.load() > 0) std::this_thread::sleep_for(std::chrono::microseconds(100));
+        const double t0 = now_ms();
+        while (rc_pending.load() > 0) {
+            if (now_ms() - t0 > kRcDrainMs) {
+                static std::atomic<bool> said{false};
+                if (!said.exchange(true))
+                    std::fprintf(stderr, "ds4: recent slots: %d fills still running %.0f ms before a prompt - the prompt goes "
+                                         "on without waiting for them\n", rc_pending.load(), now_ms() - t0);
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
         tick_begin();
         rc_tick(false);
         tick_flush();
@@ -9802,7 +9853,9 @@ struct Model::Impl {
         std::string err;
         const char* rv = std::getenv("DS4_STREAM_THREADS");
         ln_readers = std::max(1, std::min(8, rv != nullptr ? std::atoi(rv) : 2));
-        if (ln_cls.empty() || !hmap(ln_host, (size_t) pcie::kSlots * ln_stride, err) || !hmap(ln_pull, (size_t) kRing, err) ||
+        // (a window's streamed experts need kSlots of pinned staging; a token's alone, kPicks as before)
+        if (ln_cls.empty() || !hmap(ln_host, (size_t) (ln_win ? pcie::kSlots : kPicks) * ln_stride, err) ||
+            !hmap(ln_pull, (size_t) kRing, err) ||
             !hmap(ln_cal_pull, 1, err)) {
             if (!err.empty()) std::fprintf(stderr, "ds4: PCIe lane off: %s\n", err.c_str());
             for (size_t di = 0; di < ln_dev.size(); ++di) lane_free((int) di);
@@ -11746,7 +11799,7 @@ struct Model::Impl {
         for (const auto& cp : chunks) any = any || (cp != nullptr && cp->borrow);
         if (!any) return true;
         cache_drain();
-        rc_drain();
+        if (ln_one || ln_land) rc_drain();   // (the one-GPU path's; elsewhere v1.1.27's: no wait)
         for (size_t di = 0; di < chunks.size(); ++di) {
             if (chunks[di] == nullptr || !chunks[di]->borrow) continue;
             Dev& d = devs[di];
