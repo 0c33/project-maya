@@ -7,6 +7,9 @@
 // first.  A bounded row cache (clock eviction) keeps rows already fetched: a row that recurs (the same n-gram again,
 // in the prompt or later) is a copy, not a read.  The rows are the file's bytes either way, so the output is the same.
 #pragma once
+#if !defined(_WIN32)
+#include <fcntl.h>
+#endif
 
 #include "ds4_os.hpp"
 
@@ -297,7 +300,16 @@ private:
         }
         auto fd = [&](int file) {
             if (file < 0 || file >= (int) fds.size()) return os::kBadFd;
-            if (fds[(size_t) file] == os::kBadFd) fds[(size_t) file] = os::open_ro(paths_[(size_t) file]);
+            if (fds[(size_t) file] == os::kBadFd) {
+                fds[(size_t) file] = os::open_ro(paths_[(size_t) file]);
+#if !defined(_WIN32)
+                // (strata-ab, gfx906 box with 62 GiB: a row is ~1-2 KB at a hashed offset, so the kernel's readahead
+                //  window of a buffered read is ~all waste that pushes the CPU lane's experts out of the page cache -
+                //  no readahead on this reader's descriptors; DS4_EG_RANDOM=0: as before)
+                static const bool eg_random = std::getenv("DS4_EG_RANDOM") == nullptr || std::atoi(std::getenv("DS4_EG_RANDOM")) != 0;
+                if (eg_random && fds[(size_t) file] != os::kBadFd) (void) posix_fadvise(fds[(size_t) file], 0, 0, POSIX_FADV_RANDOM);
+#endif
+            }
             return fds[(size_t) file];
         };
         const os::fd_t f = fd(r.file);
