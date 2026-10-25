@@ -1,0 +1,164 @@
+diff --git a/cmake/hip_backend.cmake b/cmake/hip_backend.cmake
+index 966fa21d..06122036 100644
+--- a/cmake/hip_backend.cmake
++++ b/cmake/hip_backend.cmake
+@@ -17,6 +17,9 @@ set(_strata_hip_unvalidated gfx1010 gfx1011 gfx1012 gfx1102 gfx1103 gfx1030 gfx1
+ # spaces, which foreach(IN LISTS) would otherwise treat as one element.
+ string(REPLACE " " ";" _strata_hip_norm "${CMAKE_HIP_ARCHITECTURES}")
+ set(STRATA_HIP_ARCH_LIST "")
++# gfx906 (MI50 / Radeon Pro VII, Vega 20) and gfx908 (MI100) are wave64: they run the CUDA-shaped kernels through
++# Project Maya's logical-32-lane half-wavefront mapping (hip_compat/intrinsics.hpp, STRATA_HIP_WAVE64). strata-ab port.
++set(_strata_hip_wave64 gfx906 gfx908)
+ foreach(_arch IN LISTS _strata_hip_norm)
+   if(_arch STREQUAL "")
+     continue()
+@@ -25,6 +28,8 @@ foreach(_arch IN LISTS _strata_hip_norm)
+   if(_base IN_LIST _strata_hip_validated)
+   elseif(_base IN_LIST _strata_hip_community)
+     message(STATUS "Strata HIP: ${_base} was validated by community reports (docs/AMD_HIP.md)")
++  elseif(_base IN_LIST _strata_hip_wave64)
++    message(STATUS "Strata HIP: ${_base} is a wave64 card running through the half-wavefront compat layer (experimental)")
+   elseif(_base IN_LIST _strata_hip_unvalidated)
+     message(WARNING "Strata HIP: ${_base} builds, but it is not validated on a real card yet; please report results")
+   else()
+@@ -95,7 +100,14 @@ set(STRATA_HIP_COMPAT_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include/strata/hi
+ add_library(strata_hip_runtime INTERFACE)
+ target_include_directories(strata_hip_runtime BEFORE INTERFACE
+   "${STRATA_HIP_COMPAT_INCLUDE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/include")
+-target_compile_definitions(strata_hip_runtime INTERFACE STRATA_USE_HIP=1 "STRATA_HIP_ARCHS=\"${STRATA_HIP_ARCHS}\"")
++set(STRATA_HIP_WAVE64 OFF)
++foreach(_a IN LISTS STRATA_HIP_ARCH_LIST)
++  if(_a IN_LIST _strata_hip_wave64)
++    set(STRATA_HIP_WAVE64 ON)
++  endif()
++endforeach()
++target_compile_definitions(strata_hip_runtime INTERFACE STRATA_USE_HIP=1 "STRATA_HIP_ARCHS=\"${STRATA_HIP_ARCHS}\""
++  $<$<BOOL:${STRATA_HIP_WAVE64}>:STRATA_HIP_WAVE64=1>)
+ option(STRATA_GFX1012_PORTABLE_DOT "Use the portable signed-byte dot control on gfx1012" OFF)
+ if(STRATA_GFX1012_PORTABLE_DOT)
+   target_compile_definitions(strata_hip_runtime INTERFACE STRATA_GFX1012_PORTABLE_DOT=1)
+diff --git a/include/strata/hip_compat/cuda_runtime.h b/include/strata/hip_compat/cuda_runtime.h
+index 9f2e2f18..f370cc06 100644
+--- a/include/strata/hip_compat/cuda_runtime.h
++++ b/include/strata/hip_compat/cuda_runtime.h
+@@ -9,6 +9,13 @@
+ #define NOMINMAX
+ #endif
+ #endif
++#ifdef STRATA_HIP_WAVE64
++// wave64 (gfx906 / gfx908): HIP's own warp-sync builtins would span the whole 64-lane wavefront and break every
++// kernel's reduction order; intrinsics.hpp supplies the logical-32-lane-half mapping instead (Project Maya's layer).
++#ifndef HIP_DISABLE_WARP_SYNC_BUILTINS
++#define HIP_DISABLE_WARP_SYNC_BUILTINS 1
++#endif
++#endif  // STRATA_HIP_WAVE64
+ #include <hip/hip_runtime.h>
+ #include <hip/hip_version.h>
+ // Do not let HIP's legacy macro corrupt libstdc++ attribute names.
+@@ -63,7 +70,20 @@
+ #define cudaGraphLaunch hipGraphLaunch
+ #define cudaGraphUpload hipGraphUpload
+ #define cudaGraph_t hipGraph_t
++#ifdef STRATA_HIP_WAVE64
++// Mapped host memory is where a running kernel and the CPU spin on each other's words: on these cards it must be
++// fine-grained (coherent), or the spin may never see the other side (Project Maya's wave64 rule).
++inline hipError_t cudaHostAlloc(void** p, size_t bytes, unsigned int flags) {
++    if (flags & hipHostMallocMapped) flags |= hipHostMallocCoherent;
++    return hipHostMalloc(p, bytes, flags);
++}
++template <typename T>
++inline hipError_t cudaHostAlloc(T** p, size_t bytes, unsigned int flags) {
++    return cudaHostAlloc(reinterpret_cast<void**>(p), bytes, flags);
++}
++#else
+ #define cudaHostAlloc hipHostMalloc
++#endif  // STRATA_HIP_WAVE64
+ #if HIP_VERSION_MAJOR < 7
+ #define cudaHostAllocDefault hipHostMallocDefault
+ #define cudaHostAllocMapped hipHostMallocMapped
+diff --git a/include/strata/hip_compat/intrinsics.hpp b/include/strata/hip_compat/intrinsics.hpp
+index a3d13c32..b2d9e8ab 100644
+--- a/include/strata/hip_compat/intrinsics.hpp
++++ b/include/strata/hip_compat/intrinsics.hpp
+@@ -27,6 +27,9 @@ __device__ __forceinline__ int dp4a(int a, int b, int c) {
+     // RDNA2 has no sudot4 (that is gfx11+), but it has the plain signed v_dot4_i32_i8 (dot1-insts): the same
+     // signed x signed byte products accumulated modulo 2^32, no clamp.
+     return __builtin_amdgcn_sdot4(a, b, c, false);
++#elif (defined(__gfx906__) || defined(__gfx908__)) && __has_builtin(__builtin_amdgcn_sdot4)
++    // Vega 20 (MI50) / CDNA1 (MI100): v_dot4_i32_i8 (dot1-insts), the signed dot4 of the wave64 compat layer.
++    return __builtin_amdgcn_sdot4(a, b, c, false);
+ #elif defined(__gfx1012__) && !defined(STRATA_GFX1012_PORTABLE_DOT)
+     // RDNA1 has no native signed dot4. SDWA selects and sign-extends byte
+     // operands directly, avoiding separate shift/mask/sign-extension work.
+@@ -101,6 +104,15 @@ __device__ __forceinline__ void require_full_wave_mask(uint32_t mask) {
+     if (mask != 0xffffffffu) __builtin_trap();
+ }
+ 
++#ifdef STRATA_HIP_WAVE64
++// wave64: __syncwarp as wavefront-scope release/acquire fences around a wave barrier (HIP's own is disabled).
++__device__ __forceinline__ void syncwarp(uint32_t mask = 0xffffffffu) {
++    require_full_wave_mask(mask);
++    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
++    __builtin_amdgcn_wave_barrier();
++    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
++}
++#else
+ // Older HIP has no __syncwarp. A wave barrier alone does not order memory.
+ // Release/acquire fences cover the shared-memory exchange used by attention.
+ #if HIP_VERSION_MAJOR < 7
+@@ -111,6 +123,7 @@ __device__ __forceinline__ void syncwarp(uint32_t mask = 0xffffffffu) {
+     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup");
+ }
+ #endif
++#endif  // STRATA_HIP_WAVE64 (syncwarp)
+ 
+ template <typename T>
+ __device__ __forceinline__ T shfl_xor_sync(uint32_t mask, T value, int lane_mask, int width = 32) {
+@@ -138,7 +151,12 @@ __device__ __forceinline__ T shfl_sync(uint32_t mask, T value, int source_lane,
+ 
+ __device__ __forceinline__ unsigned ballot_sync(uint32_t mask, int predicate) {
+     require_full_wave_mask(mask);
++#ifdef STRATA_HIP_WAVE64
++    // wave64: a CUDA warp is the caller's 32-lane half; lanes 32..63 see their own half's bits.
++    return static_cast<unsigned>(__ballot(predicate) >> (__lane_id() & 32));
++#else
+     return static_cast<unsigned>(__ballot(predicate));
++#endif
+ }
+ 
+ }  // namespace strata::hip_compat
+@@ -153,11 +171,17 @@ __device__ __forceinline__ unsigned ballot_sync(uint32_t mask, int predicate) {
+ #define __shfl_up_sync(...) (::strata::hip_compat::shfl_up_sync(__VA_ARGS__))
+ #define __shfl_sync(...) (::strata::hip_compat::shfl_sync(__VA_ARGS__))
+ #define __ballot_sync(mask, predicate) (::strata::hip_compat::ballot_sync((mask), (predicate)))
+-#if HIP_VERSION_MAJOR < 7
++#ifdef STRATA_HIP_WAVE64
++#define __syncwarp(...) (::strata::hip_compat::syncwarp(__VA_ARGS__))
++#elif HIP_VERSION_MAJOR < 7
+ #define __syncwarp(...) (::strata::hip_compat::syncwarp(__VA_ARGS__))
+ #endif
+ // AMD's sleep instruction accepts only 0..15; the synchronization loops use it as a
+ // backoff hint, so use its smallest portable delay independently of CUDA cycle counts.
++#ifdef STRATA_HIP_WAVE64
++#define __nanosleep(ns) __builtin_amdgcn_s_sleep((ns) >= 400u ? 8u : 1u)
++#else
+ #define __nanosleep(cycles) __builtin_amdgcn_s_sleep(1)
++#endif
+ 
+ #endif  // defined(__HIPCC__)
+diff --git a/src/core/device.cu b/src/core/device.cu
+index 5c59554b..a152e1b5 100644
+--- a/src/core/device.cu
++++ b/src/core/device.cu
+@@ -58,7 +58,11 @@ std::string arch_problem(const cudaDeviceProp& p, int ordinal) {
+                "); compile it for this card (./setup.sh --backend hip, or -DCMAKE_HIP_ARCHITECTURES=" + arch +
+                ", docs/AMD_HIP.md) or choose another GPU with HIP_VISIBLE_DEVICES";
+     }
++#ifdef STRATA_HIP_WAVE64
++    if (p.warpSize != 32 && p.warpSize != 64) {   // (wave64 gfx906 / gfx908: the compat layer's half-wavefront mapping)
++#else
+     if (p.warpSize != 32) {
++#endif
+         return card + " runs wave" + std::to_string(p.warpSize) + "; Strata's HIP kernels need wave32";
+     }
+     return "";

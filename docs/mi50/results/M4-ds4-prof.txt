@@ -1,0 +1,4 @@
+GPU per token (DS4_PROF): 278.69 ms - between layers 0.16, attention 26.48, routing + shared expert 10.72, experts gate/up 4.20, waiting for the CPU lane 233.44, down + post 3.69; 127 tokens
+GPU per token (DS4_PROF): 169.49 ms - between layers 0.16, attention 27.66, routing + shared expert 10.94, experts gate/up 4.68, waiting for the CPU lane 121.99, down + post 4.05; 127 tokens
+GPU per token (DS4_PROF): 105.06 ms - between layers 0.17, attention 27.92, routing + shared expert 11.23, experts gate/up 5.07, waiting for the CPU lane 56.31, down + post 4.36; 127 tokens
+GPU per token (DS4_PROF): 89.65 ms - between layers 0.17, attention 28.14, routing + shared expert 11.30, experts gate/up 5.16, waiting for the CPU lane 40.48, down + post 4.40; 127 tokens

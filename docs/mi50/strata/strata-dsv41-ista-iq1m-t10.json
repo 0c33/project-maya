@@ -1,0 +1,35 @@
+{
+  "exe": "/s/build-dsv41-906/strata-dsv41",
+  "args": [
+    "--pack",
+    "/models/ds41-ista/IQ1_M/strata-dsv41",
+    "--max-context",
+    "65536",
+    "--eos",
+    "1",
+    "--dspark",
+    "auto",
+    "--dspark-conf",
+    "0.65",
+    "--tp",
+    "2",
+    "--cpu-threads",
+    "10"
+  ],
+  "cwd": "/s",
+  "tokenizer": "/models/ds41-ista/IQ1_M/strata-dsv41/tokenizer",
+  "model_name": "deepseek-v4.1-flash-1017",
+  "arch": "deepseek41",
+  "backend": "hip",
+  "gpu": [
+    0,
+    1
+  ],
+  "lib_dirs": [
+    "/opt/rocm/lib"
+  ],
+  "host": "0.0.0.0",
+  "port": 8181,
+  "log": "/logs/strata-dsv41-engine.log",
+  "engine_ready_s": 3600
+}

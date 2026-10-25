@@ -1,0 +1,7 @@
+# deepseek-maya.service: Project Maya (gfx906 port) serving DeepSeek-V4.1-Flash-1017 (serve-maya.sh knobs, one VAR=value per line)
+#   maya-ds4-ista-iq1m-prod.json  ISTA-DASLab GSQ-RCO IQ1_M (1.75 bpw), 256k context, conversation slots on, no drafter (default)
+#   maya-ds4-maya-xs.json          Maya-XS (IQ1_S, slightly better perplexity, slower on some prompts; 64k context, no slots)
+CFG=maya-ds4-ista-iq1m-prod.json
+# the LAN port of the production server (strata-flashnext / vllm-qwen38 are stopped when this one starts)
+PUBLISH=0.0.0.0:8000
+EXTRA_DOCKER=

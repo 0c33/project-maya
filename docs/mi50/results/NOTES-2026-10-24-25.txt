@@ -1,0 +1,43 @@
+=== 2026-10-24 evening (user asleep, "don't ask, just do it"; disk grown to 1.4 TB) ===
+Production strata-flashnext was DOWN since 2026-10-23 20:52:32 (safe-run TRIP: card1 temp3 read failure, temps 38 C; 3rd such event).
+Left down during the DeepSeek work (needs both GPUs + RAM); restore at the end.
+New upstream: Strata 0.2.4.2 (src/dsv41 = port of Maya v1.1.17's maya-ds4; ISTA IQ1_M/IQ2_XXS/IQ2_XS sets; HIP wave32 only,
+  CMake excludes dsv41 from STRATA_HIP_GFX906), Project Maya v1.1.27 (maya-ds4; wave64 compat layer for gfx908; PR #397
+  gfx906 = same edits as ours, GLM-only validation, "DeepSeek not validated"), Xolotl 9f693fd (V4 quant, ISTA GGUF + Engram
+  GGUF loading, AVX2 Q2_0 CPU rows, prefetch dummy-DMA skip).
+Builds (all gfx906, ROCm 7.14 image): maya-port/build-906/maya-ds4 (ds4_gguf_test: all formats bit-exact except IQ4_XS/Q4_K
+  window-vs-token bit identity; hip_intrinsics OK); Strata-0242/build-dsv41-906/strata-dsv41 (build/strata-dsv41-wave64-port.py);
+  Xolotl-port2 (upstream + port patch) build-906/ds41_generate + ds41_helper.
+Xolotl decode, XQ v2, 4k prompt, 128 tok x3 (downloads running in background):
+  X1-xol2-base   upstream 9f693fd, D2 config        5.96 (5.41/6.27/5.96)  tier 219-231 ms  <- upstream regression on gfx906
+  X0-xol1-control old port (d4f6506), D2 config      7.07 (5.00/7.93/7.07)  tier 148-181 ms
+  X1b-xol2-dummy upstream + STRATA_PF_NO_DUMMY=0     6.40 (5.62/7.38/6.40)  tier 169-213 ms
+  X0b-xol1-rb10  old port, --route-bias 1.0 / file 0.6  8.97 (8.35/10.08/8.97) pcie 2.5k vs 8.2k, tier 64-86 ms
+PPL (bench/ds41_ppl.sh, data/ppl/ppl3k: BOS + 1.5k tok of bench/abbench.py + 1.5k tok of REPORT.md; XQ v2, old port):
+  Q0 bias 0/0 (exact)   PPL 5.2105  top-1 0.640
+  Q1 bias 0.5/0.3 (serve config)  PPL 5.6043 (+7.6%)  top-1 0.611
+  Q2 bias 1.0/0.6       PPL 7.8884 (+51%)  top-1 0.568   -> the 8.97 tok/s arm is too lossy
+Equal-terms arms (bench/ds_cmp_queue.sh: page cache evicted, slots cleared, WARMUP=256 REPS=3; decode medians tok/s, prompt read tok/s):
+  C1 Maya IQ1_M (dspark none, 10 thr auto)   4k 9.96 / codegen 9.97 (one 75 s stall rep: my concurrent packing I/O) / codeedit 9.24; prompt 71.9 / 14.9 / 46.2
+  C2 Strata dsv41 IQ1_M --cpu-threads 10     4k 8.48 / codegen 9.18 / codeedit 10.13; prompt 40.4 / 8.8 / 9.4   -> Maya wins on prompts
+  C3 Maya Maya-XS (IQ1_S, Q8_0 dense)        4k 8.44 / codegen 9.53 / codeedit 9.48; prompt 58.4 / 17.4 / 4.5 (codeedit read 308 s?)
+  C4 Maya IQ2_XXS: HOST WENT DOWN ~00:05:05 2 s into the 4k prompt read (sensors 41-54 C, cap 75 W; no TRIP). Host back 13:10,
+     LXC 18:42 on 2026-10-25; power caps reset to 190 W (user restoring 75 W on the host). Not reproduced/understood.
+2026-10-25 evening (after host reboot; user restored 75 W caps 18:51; "continue as before"):
+  PPL (bench/maya_ppl.sh, same 3k ids): Maya ISTA IQ1_M 5.6131; Maya Maya-XS 5.4730 (Xolotl XQ v2: exact 5.2105, serve bias 5.6043)
+  Smoke (prod config maya-ds4-ista-iq1m-prod.json: 256k ctx, slots on): tool call / reasoning / en de ar ALL OK
+  Agents (opencode): A9 t1 PASS 362 s, t4 PASS 407 s; A10 t2 PASS 398 s, t3 PASS 365 s (stock Engram reader: stalls 50/20/10/10 s,
+    threads in folio_wait_bit_common on mmap'd expert pages; NVMe probe worst 17 ms -> not the drive)
+  Maya patch DS4_EG_RANDOM (POSIX_FADV_RANDOM on the Engram row reader's fds, src/ds4/ds4_engram_io.hpp), rebuilt (maya-build-2):
+    A11 t1 PASS 205 s, t4 PASS 324 s (colder start), no stall >= 8 s; A12 t5_longctx PASS 591 s -> 5/5 tasks pass on Maya
+  THERMAL: A12 (10 min sustained) card1 junction peak 79 C at 75 W (watchdog 80 C) - sustained DeepSeek agent work runs at the edge.
+  deepseek-maya.service installed (disabled), /etc/default/deepseek-maya (PUBLISH 0.0.0.0:8000).
+  PPL Maya ISTA IQ2_XXS 5.3512.  C4b Maya IQ2_XXS (DS4_EG_RANDOM build, C1 protocol; host did NOT crash this time):
+    4k 9.36 (1.35, 9.66, 9.36) / codegen 6.26 (3.28, 6.26, 7.90) / codeedit 7.15 (7.15, 7.54, 3.31); prompt 48.8 / 14.0 / 2.7 tok/s
+    -> better quality, slower + unstable here (132 GB of experts vs 62 GiB RAM); IQ1_M stays default.
+  C1b Maya IQ1_M, final build (DS4_EG_RANDOM) + prod config (256k, slots): 4k 11.10 (9.70, 11.10, 11.36) / codegen 7.77 (1.71, 7.77, 9.49) /
+    codeedit 8.23 (8.23, 9.00, 2.32); prompt 68.9 / 17.1 / 46.2 tok/s. The slow reps hold a >= 10 s stall each (cold cache + prompt switch);
+    agent runs A11/A12 had none >= 8 s.
+  CORRECTION: serve log maya-serve-prod2.log (A11 + A12) has stalls >= 8 s of ~20, 10, 10 s - all during A12 (t5_longctx); A11 had none.
+    So DS4_EG_RANDOM removed the 50 s freezes and sped t1/t4 up 20-43%, but 10-20 s stalls remain on long contexts.
+  Engram row = 256 IQ4_NL values = 144 bytes; 2 Engram layers x 24 hash columns = 48 row reads a token.

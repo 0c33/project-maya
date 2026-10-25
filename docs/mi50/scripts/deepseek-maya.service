@@ -1,0 +1,27 @@
+[Unit]
+Description=DeepSeek-V4.1-Flash-1017 on 2x MI50 (Project Maya maya-ds4, gfx906 port; serve-maya.sh) under the thermal watchdog
+Documentation=file:///root/strata-ab/HANDOFF-DEEPSEEK.md
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+# the GPUs, ~60 GB of RAM and port 8000 are shared with the other servers: starting one stops the others
+Conflicts=strata-flashnext.service vllm-qwen38.service
+After=strata-flashnext.service vllm-qwen38.service
+StartLimitIntervalSec=3600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/root/strata-ab
+Environment=HOME=/root
+EnvironmentFile=-/etc/default/deepseek-maya
+ExecStartPre=-/usr/bin/docker rm -f maya
+ExecStart=/root/gfx-build/gpu-tune/safe-run.sh -l 80 -- /root/strata-ab/serve-maya.sh
+ExecStop=/usr/bin/docker stop -t 60 maya
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=120
+RestartPreventExitStatus=3 5
+
+[Install]
+WantedBy=multi-user.target

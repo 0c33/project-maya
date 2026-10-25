@@ -1,0 +1,2 @@
+{"tag": "A11-maya-egrandom", "task": "t1_bugfix", "pass": 1, "agent_rc": 0, "seconds": 205, "detail": "4 passed in 0.01s"}
+{"tag": "A11-maya-egrandom", "task": "t4_logreport", "pass": 1, "agent_rc": 0, "seconds": 324, "detail": "10.0.3.19 189|10.0.3.4 187|10.0.0.37 183|5xx 143|"}

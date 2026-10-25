@@ -1,0 +1,42 @@
+{
+  "exe": "/maya/build-906/maya-ds4",
+  "args": [
+    "--pack",
+    "/models/ds41-ista/IQ1_M/maya-ds4",
+    "--max-context",
+    "262144",
+    "--tp",
+    "2",
+    "--reserve-mib",
+    "1024",
+    "--dspark",
+    "none",
+    "--vision",
+    "off"
+  ],
+  "cwd": "/maya",
+  "tokenizer": "/models/ds41-ista/IQ1_M/maya-ds4/tokenizer",
+  "backend": "hip",
+  "model_name": "deepseek-v4.1-flash-1017",
+  "gpu": [
+    0,
+    1
+  ],
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 1.0
+  },
+  "reasoning_effort": "high",
+  "lib_dirs": [
+    "/opt/rocm/lib"
+  ],
+  "host": "0.0.0.0",
+  "port": 8171,
+  "log": "/logs/maya-ds4-engine.log",
+  "env": {
+    "MAYA_DS4_SLOT_KEEP": "1"
+  },
+  "installer": {
+    "family": "deepseek"
+  }
+}

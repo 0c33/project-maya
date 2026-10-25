@@ -1,0 +1,2 @@
+ppl: sequence 0, 3001 tokens: 5.6131
+perplexity 5.6131 over 3000 tokens of 1 sequences
