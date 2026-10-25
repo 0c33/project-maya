@@ -563,6 +563,23 @@ hand theirs. The load line names the blocks a GPU holds (`+ blocks 0`).
 | --- | --- | --- |
 | `MAYA_DS4_DRAFT_DEV` | off (every block on the lead) | the member each DSpark block runs on: one number for every block, or one a block (`1,0,0`: block 0 on member 1, the others on the lead); 0 is the lead |
 
+## DeepSeek: a helper GPU for the experts VRAM leaves over
+
+A GGUF pack's routed experts that do not fit the layer GPUs' VRAM run on the CPU lane. A GPU that is not one of the
+layer devices - an integrated one (Strix Halo's Radeon 8060S beside discrete cards) or a small extra card - can take
+those instead: `MAYA_DS4_HELPER=<visible GPU>` with `MAYA_DS4_HELPER_GB=<GB>` gives it a pool of the most-routed
+experts the layer GPUs do not hold (by the expert profile). Its picks run on its own stream from the window's plan
+(decode and a DSpark verify window), the CPU lane's service thread adds the sums, and a failure or a 10 s silence hands
+the picks back to the CPU lane. An expert is summed on the helper instead of the CPU lane, so its output can differ in
+the last bits. The DeepSeek counterpart of GLM's `STRATA_GLM_EXPERT_HELPER` (#201).
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_HELPER` | off | the helper's visible GPU index (not one of `--gpus`); with `MAYA_DS4_HELPER_GB` |
+| `MAYA_DS4_HELPER_GB` | - | its experts' pool, GB |
+| `MAYA_DS4_WARM_CAP_GB` | - | required with the helper: the load's experts in host RAM, GB, beside the pool (an integrated GPU's pool is host RAM too); ignored under `DS4_REQUIRE_ALL_RAM=1` (every expert in RAM) |
+| `MAYA_DS4_HELPER_CHECK` | off | `1`: at load, two tokens per expert format through the helper against the CPU lane, and its grouped window path against its per-token one, bit for bit |
+
 ## DeepSeek: where the measured hipBLASLt picks are kept (AMD)
 
 On AMD the engine measures hipBLASLt's kernels for each prompt GEMM shape at its first use on a GPU and keeps the
